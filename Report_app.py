@@ -23,6 +23,9 @@ def generate_general_report():
     SELECT
       SUBSTRING_INDEX(s.sku, '-', 2) AS SKU,  -- Extract the first two dash-separated groups from SKU
       ANY_VALUE(s.`Item Name`) AS item_name,  -- Use the item name from the current stock_summary table
+      ANY_VALUE(sa.`item.CF.Country of Origin`) AS country_of_origin,  -- Country of origin from sales_by_item
+      ANY_VALUE(sa.`category_name`) AS category,  -- Category from sales_by_item
+      ANY_VALUE(sa.`item.CF.Grape Varieties`) AS grape_varieties,  -- Grape varieties from sales_by_item
       SUM(COALESCE(s.`Opening Stock`, 0)) AS opening_balance,  -- Total opening stock
       SUM(COALESCE(p.quantity_purchased, 0)) AS purchase,  -- Total quantity purchased
       SUM(DISTINCT COALESCE(sa.quantity_sold, 0)) AS sales_current_year,  -- Total sales for the current year (distinct to avoid duplicates)
