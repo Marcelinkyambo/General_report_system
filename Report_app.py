@@ -19,44 +19,63 @@ def connect_to_database():
 def generate_general_report():
     conn = connect_to_database()
 
-    # Updated query to generate the general report with an extra column for previous sales and comparison percentage
     query = """ 
     SELECT
-      SUBSTRING_INDEX(s.sku, '-', 2) AS SKU,
-      ANY_VALUE(COALESCE(s.`Item Name`, p.item_name, sa.item_name)) AS item_name,
-      SUM(COALESCE(s.`Opening Stock`, 0)) AS opening_balance,
-      SUM(COALESCE(p.quantity_purchased, 0)) AS purchase,
-      SUM(COALESCE(sa.quantity_sold, 0)) AS sales_current_year,
-      SUM(COALESCE(s.`Quantity Out`, 0) - COALESCE(sa.quantity_sold, 0)) AS write_offs_discrepancies,
-      SUM(s.`Opening Stock`)
+      SUBSTRING_INDEX(s.sku, '-', 2) AS SKU,  -- Extract the first two dash-separated groups from SKU
+      ANY_VALUE(s.`Item Name`) AS item_name,  -- Use the item name from the current stock_summary table
+      SUM(COALESCE(s.`Opening Stock`, 0)) AS opening_balance,  -- Total opening stock
+      SUM(COALESCE(p.quantity_purchased, 0)) AS purchase,  -- Total quantity purchased
+      SUM(DISTINCT COALESCE(sa.quantity_sold, 0)) AS sales_current_year,  -- Total sales for the current year (distinct to avoid duplicates)
+      -- Correct calculation for closing balance
+      SUM(COALESCE(s.`Opening Stock`, 0))
       + SUM(COALESCE(p.quantity_purchased, 0))
-      - SUM(COALESCE(sa.quantity_sold, 0)) AS closing_balance,
-      SUM(COALESCE(sp.quantity_sold, 0)) AS sales_previous_year,  -- New column for previous sales
+      - SUM(DISTINCT COALESCE(sa.quantity_sold, 0)) AS closing_balance,  -- Actual closing balance
+      -- Calculate discrepancies directly
+      SUM(COALESCE(s.`Closing Stock`, 0))  -- Actual closing stock
+      - (
+          SUM(COALESCE(s.`Opening Stock`, 0))  -- Expected closing = Opening + Purchases - Sales
+          + SUM(COALESCE(p.quantity_purchased, 0))
+          - SUM(DISTINCT COALESCE(sa.quantity_sold, 0))
+        ) AS discrepancies,  -- Discrepancy = Actual Closing - Expected Closing
+      SUM(DISTINCT COALESCE(sp.quantity_sold, 0)) AS sales_previous_year,  -- Total sales for the previous year (distinct to avoid duplicates)
       CASE 
-        WHEN SUM(COALESCE(sp.quantity_sold, 0)) = 0 THEN NULL
+        WHEN SUM(COALESCE(sp.quantity_sold, 0)) = 0 THEN NULL  -- Avoid division by zero
         ELSE ROUND(
-          (SUM(COALESCE(sa.quantity_sold, 0)) - SUM(COALESCE(sp.quantity_sold, 0)))
-          / SUM(COALESCE(sp.quantity_sold, 0)) * 100,
+          (SUM(DISTINCT COALESCE(sa.quantity_sold, 0)) - SUM(DISTINCT COALESCE(sp.quantity_sold, 0)))
+          / SUM(DISTINCT COALESCE(sp.quantity_sold, 0)) * 100,
           2
         )
-      END AS sales_comparison_percentage  -- New column for sales comparison
+      END AS sales_comparison_percentage,  -- Percentage difference between current and previous sales
+      -- Calculate % Sales Over Stock
+      CASE 
+        WHEN (SUM(COALESCE(s.`Opening Stock`, 0)) + SUM(COALESCE(p.quantity_purchased, 0))) = 0 THEN NULL  -- Avoid division by zero
+        ELSE ROUND(
+          (SUM(DISTINCT COALESCE(sa.quantity_sold, 0)) / 
+          (SUM(COALESCE(s.`Opening Stock`, 0)) + SUM(COALESCE(p.quantity_purchased, 0)))) * 100,
+          2
+        )
+      END AS sales_over_stock_percentage  -- Percentage of sales over stock
     FROM stock_summary AS s
     LEFT JOIN purchases_by_item AS p 
       ON s.sku = p.sku
     LEFT JOIN sales_by_item AS sa 
       ON s.`Item ID` = sa.item_id
     LEFT JOIN sales_by_item_previous AS sp
-      ON sa.item_id = sp.item_id
+      ON s.`Item ID` = sp.item_id  -- Match based on the correct column
     GROUP BY 
       SUBSTRING_INDEX(s.sku, '-', 2)
     ORDER BY 
       SUBSTRING_INDEX(s.sku, '-', 2);
     """
 
-    # Execute the query
-    df = pd.read_sql(query, conn)
+    try:
+        df = pd.read_sql(query, conn)
+    except Exception as e:
+        st.error(f"⚠️ An error occurred while generating the report: {e}")
+        return pd.DataFrame()  # Return an empty DataFrame in case of error
+    finally:
+        conn.close()
 
-    conn.close()
     return df
 
 # ----------------- CSV Upload to Table ----------------- #
