@@ -15,6 +15,20 @@
             "username": "root",
             "connectionTimeout": 50,
             "askForPassword": true
+        },
+        {
+            "mysqlOptions": {
+                "authProtocol": "default",
+                "enableSsl": "Disabled"
+            },
+            "previewLimit": 50,
+            "server": "localhost",
+            "port": 3306,
+            "driver": "MySQL",
+            "name": "data_analysis",
+            "group": "data",
+            "database": "data_analysis",
+            "username": "root"
         }
     ]
 }

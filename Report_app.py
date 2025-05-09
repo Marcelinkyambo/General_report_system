@@ -1,208 +1,322 @@
 import streamlit as st
 import mysql.connector
 import pandas as pd
-import io
+import numpy as np
+import hashlib
 import plotly.express as px
+from io import BytesIO
+from fpdf import FPDF
+import openpyxl  # ensure ExcelWriter engine is available
 
 # ----------------- Database Connection ----------------- #
 def connect_to_database():
-    connection = mysql.connector.connect(
+    return mysql.connector.connect(
         host="localhost",
         user="root",
-        password="Root@123",  # 🔥 Replace with your password
-        database="inventory_db",  # 🔥 Replace with your database
-        #auth_plugin="mysql_native_password"  # Specify the authentication plugin
+        password="Root@123",
+        database="data_analysis",
     )
-    return connection
+
+# ----------------- User Auth Helpers ----------------- #
+def create_users_table():
+    conn = connect_to_database()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+          username VARCHAR(50) PRIMARY KEY,
+          password_hash CHAR(64) NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def hash_password(pw: str) -> str:
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+def register_user(username: str, password: str) -> bool:
+    conn = connect_to_database()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO users(username, password_hash) VALUES (%s, %s)",
+            (username, hash_password(password))
+        )
+        conn.commit()
+        return True
+    except mysql.connector.IntegrityError:
+        return False
+    finally:
+        cur.close()
+        conn.close()
+
+def login_user(username: str, password: str) -> bool:
+    conn = connect_to_database()
+    cur = conn.cursor()
+    cur.execute("SELECT password_hash FROM users WHERE username=%s", (username,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return bool(row and row[0] == hash_password(password))
+
+create_users_table()
+
+# ----------------- Helpers for Downloads ----------------- #
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode('utf-8')
+
+def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Sheet1')
+    return output.getvalue()
+
+def df_to_pdf_bytes(df: pd.DataFrame) -> bytes:
+    pdf = FPDF(orientation='L', unit='mm', format='A4')
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Arial", size=7)
+
+    # dynamic column widths
+    padding = 2
+    col_widths = []
+    for col in df.columns:
+        max_w = pdf.get_string_width(str(col)) + padding
+        for val in df[col]:
+            w = pdf.get_string_width(str(val)) + padding
+            if w > max_w:
+                max_w = w
+        col_widths.append(max_w)
+
+    table_w = sum(col_widths)
+    epw = pdf.w - 2 * pdf.l_margin
+    if table_w > epw:
+        scale = epw / table_w
+        col_widths = [w * scale for w in col_widths]
+
+    row_h = pdf.font_size * 1.2
+
+    # header
+    for i, header in enumerate(df.columns):
+        pdf.cell(col_widths[i], row_h, str(header), border=1, align='C')
+    pdf.ln(row_h)
+
+    # rows
+    for _, row in df.iterrows():
+        for i, cell in enumerate(row):
+            pdf.cell(col_widths[i], row_h, str(cell), border=1)
+        pdf.ln(row_h)
+
+    return pdf.output(dest='S').encode('latin-1')
+
+# ----------------- Layout & Title ----------------- #
+st.set_page_config(page_title="General Report System", layout="wide")
+st.markdown("<h1 style='text-align:center;'>📦 General Report & P&S Forecast</h1>", unsafe_allow_html=True)
+
+# ----------------- Session State Init ----------------- #
+for key, default in [
+    ("logged_in", False),
+    ("username", ""),
+    ("report_df", pd.DataFrame()),
+    ("forecast_df", pd.DataFrame())
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ----------------- Authentication ----------------- #
+if not st.session_state.logged_in:
+    c1, c2, c3 = st.columns([1,2,1])
+    with c2:
+        st.subheader("🔐 Please log in or register")
+        mode = st.radio("", ["Login","Register"], horizontal=True)
+        user = st.text_input("Username")
+        pwd  = st.text_input("Password", type="password")
+        if mode == "Register" and st.button("Create Account"):
+            if register_user(user, pwd):
+                st.success("Account created! Please log in.")
+            else:
+                st.error("Username already exists.")
+        if mode == "Login" and st.button("Log In"):
+            if login_user(user, pwd):
+                st.session_state.logged_in = True
+                st.session_state.username = user
+                st.rerun()
+            else:
+                st.error("Invalid credentials.")
+    st.stop()
+
+# ----------------- Sidebar: CSV Import & Delete ----------------- #
+with st.sidebar:
+    st.write(f"👤 Logged in as **{st.session_state.username}**")
+    if st.button("Log Out"):
+        st.session_state.logged_in = False
+        st.rerun()
+
+    if st.session_state.username.lower() == "marcelin":
+        st.header("📄 Import CSV to Table")
+        base_table = st.selectbox("Table", ["stock_summary","sales_by_item","purchases_by_item"])
+        year_opt   = st.selectbox("Report Year", ["Current Year","Previous Year"])
+        uploaded   = st.file_uploader("Upload CSV", type=["csv"])
+        if st.button("Upload to DB"):
+            if uploaded:
+                df = pd.read_csv(uploaded).where(pd.notna(pd.read_csv(uploaded)), None)
+                if not df.empty:
+                    table_name = base_table + ("" if year_opt=="Current Year" else "_previous")
+                    conn = connect_to_database()
+                    cur = conn.cursor()
+                    for _, row in df.iterrows():
+                        cols = ",".join(f"`{c}`" for c in row.index)
+                        ph   = ",".join(["%s"]*len(row))
+                        cur.execute(f"INSERT INTO {table_name} ({cols}) VALUES ({ph})", tuple(row))
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    st.success("Uploaded!")
+                else:
+                    st.warning("Empty file.")
+
+        st.header("🗑️ Delete Options")
+        if st.button("Delete All Data"):
+            table_name = base_table + ("" if year_opt=="Current Year" else "_previous")
+            conn = connect_to_database()
+            cur  = conn.cursor()
+            cur.execute(f"DELETE FROM {table_name}")
+            conn.commit()
+            cur.close()
+            conn.close()
+            st.success(f"Cleared {table_name}")
+
+        if st.button("Clear Entire Database"):
+            for t in [
+                "stock_summary","sales_by_item","purchases_by_item",
+                "stock_summary_previous","sales_by_item_previous","purchases_by_item_previous"
+            ]:
+                conn = connect_to_database()
+                cur  = conn.cursor()
+                cur.execute(f"DELETE FROM {t}")
+                conn.commit()
+                cur.close()
+                conn.close()
+            st.success("All tables cleared!")
+    else:
+        st.info("Welcome!") 
 
 # ----------------- General Report Query ----------------- #
 def generate_general_report():
     conn = connect_to_database()
-
-    query = """ 
+    q = """
     SELECT
-      SUBSTRING_INDEX(s.sku, '-', 2) AS SKU,  -- Extract the first two dash-separated groups from SKU
-      ANY_VALUE(s.`Item Name`) AS item_name,  -- Use the item name from the current stock_summary table
-      ANY_VALUE(sa.`item.CF.Country of Origin`) AS country_of_origin,  -- Country of origin from sales_by_item
-      ANY_VALUE(sa.`category_name`) AS category,  -- Category from sales_by_item
-      ANY_VALUE(sa.`item.CF.Grape Varieties`) AS grape_varieties,  -- Grape varieties from sales_by_item
-      SUM(COALESCE(s.`Opening Stock`, 0)) AS opening_balance,  -- Total opening stock
-      SUM(COALESCE(p.quantity_purchased, 0)) AS purchase,  -- Total quantity purchased
-      SUM(DISTINCT COALESCE(sa.quantity_sold, 0)) AS sales_current_year,  -- Total sales for the current year (distinct to avoid duplicates)
-      -- Correct calculation for closing balance
-      SUM(COALESCE(s.`Opening Stock`, 0))
-      + SUM(COALESCE(p.quantity_purchased, 0))
-      - SUM(DISTINCT COALESCE(sa.quantity_sold, 0)) AS closing_balance,  -- Actual closing balance
-      -- Calculate discrepancies directly
-      SUM(COALESCE(s.`Closing Stock`, 0))  -- Actual closing stock
-      - (
-          SUM(COALESCE(s.`Opening Stock`, 0))  -- Expected closing = Opening + Purchases - Sales
-          + SUM(COALESCE(p.quantity_purchased, 0))
-          - SUM(DISTINCT COALESCE(sa.quantity_sold, 0))
-        ) AS discrepancies,  -- Discrepancy = Actual Closing - Expected Closing
-      SUM(DISTINCT COALESCE(sp.quantity_sold, 0)) AS sales_previous_year,  -- Total sales for the previous year (distinct to avoid duplicates)
-      CASE 
-        WHEN SUM(COALESCE(sp.quantity_sold, 0)) = 0 THEN NULL  -- Avoid division by zero
-        ELSE ROUND(
-          (SUM(DISTINCT COALESCE(sa.quantity_sold, 0)) - SUM(DISTINCT COALESCE(sp.quantity_sold, 0)))
-          / SUM(DISTINCT COALESCE(sp.quantity_sold, 0)) * 100,
-          2
-        )
-      END AS sales_comparison_percentage,  -- Percentage difference between current and previous sales
-      -- Calculate % Sales Over Stock
-      CASE 
-        WHEN (SUM(COALESCE(s.`Opening Stock`, 0)) + SUM(COALESCE(p.quantity_purchased, 0))) = 0 THEN NULL  -- Avoid division by zero
-        ELSE ROUND(
-          (SUM(DISTINCT COALESCE(sa.quantity_sold, 0)) / 
-          (SUM(COALESCE(s.`Opening Stock`, 0)) + SUM(COALESCE(p.quantity_purchased, 0)))) * 100,
-          2
-        )
-      END AS sales_over_stock_percentage  -- Percentage of sales over stock
-    FROM stock_summary AS s
-    LEFT JOIN purchases_by_item AS p 
-      ON s.sku = p.sku
-    LEFT JOIN sales_by_item AS sa 
-      ON s.`Item ID` = sa.item_id
-    LEFT JOIN sales_by_item_previous AS sp
-      ON s.`Item ID` = sp.item_id  -- Match based on the correct column
-    GROUP BY 
-      SUBSTRING_INDEX(s.sku, '-', 2)
-    ORDER BY 
-      SUBSTRING_INDEX(s.sku, '-', 2);
+      SUBSTRING_INDEX(s.sku,'-',2)        AS SKU,
+      ANY_VALUE(s.`Item Name`)            AS item_name,
+      MAX(sa.`category_name`)             AS category,
+      SUM(COALESCE(s.`Opening Stock`,0))  AS opening_balance,
+      SUM(COALESCE(p.quantity_purchased,0)) AS purchase,
+      SUM(COALESCE(sa.quantity_sold,0))   AS sales_current_year,
+      SUM(COALESCE(sa.quantity_sold,0)*COALESCE(sa.rate,0)) AS sales_value_current_year,
+      SUM(COALESCE(sp.quantity_sold,0))   AS sales_previous_year,
+      SUM(COALESCE(sp.quantity_sold,0)*COALESCE(sp.rate,0)) AS sales_value_previous_year,
+      SUM(COALESCE(s.`Opening Stock`,0))
+        +SUM(COALESCE(p.quantity_purchased,0))
+        -SUM(COALESCE(sa.quantity_sold,0)) AS closing_balance,
+      ( SUM(COALESCE(s.`Opening Stock`,0))
+        +SUM(COALESCE(p.quantity_purchased,0))
+        -SUM(COALESCE(sa.quantity_sold,0))
+        -SUM(COALESCE(s.`Closing Stock`,0)) ) AS discrepancies
+    FROM stock_summary s
+    LEFT JOIN purchases_by_item p ON s.sku=p.sku
+    LEFT JOIN sales_by_item sa ON s.`Item Name`=sa.item_name
+    LEFT JOIN sales_by_item_previous sp ON s.`Item Name`=sp.item_name
+    GROUP BY SUBSTRING_INDEX(s.sku,'-',2)
+    ORDER BY SKU;
     """
-
     try:
-        df = pd.read_sql(query, conn)
+        df = pd.read_sql(q, conn)
     except Exception as e:
-        st.error(f"⚠️ An error occurred while generating the report: {e}")
-        return pd.DataFrame()  # Return an empty DataFrame in case of error
+        st.error(f"Error: {e}")
+        df = pd.DataFrame()
     finally:
         conn.close()
-
     return df
 
-# ----------------- CSV Upload to Table ----------------- #
-def upload_csv_to_table(uploaded_file, table_name, year_option):
-    conn = connect_to_database()
-    cursor = conn.cursor()
-    df = pd.read_csv(uploaded_file)
-    df = df.where(pd.notna(df), None)  # Replace NaN with None for the entire DataFrame
-
-    # Determine the target table based on the year option
-    if year_option == "Previous Year":
-        table_name = f"{table_name}_previous"
-
-    print(f"Year Option: {year_option}")  # Debugging log
-    print(f"Target Table: {table_name}")  # Debugging log
-
-    # Check if the DataFrame is empty
-    if df.empty:
-        st.warning("⚠️ The uploaded CSV file is empty. Please upload a valid file.")
-        return
-
-    print(f"Number of rows in CSV: {len(df)}")  # Debugging log
-    print(f"DataFrame Columns: {df.columns.tolist()}")  # Debugging log
-
-    for _, row in df.iterrows():
-        cols = ",".join([f"`{col}`" for col in row.index])  # Wrap columns with backticks
-        placeholders = ",".join(["%s"] * len(row))
-        sql = f"INSERT INTO {table_name} ({cols}) VALUES ({placeholders})"
-        try:
-            cursor.execute(sql, tuple(row))
-        except mysql.connector.Error as err:
-            print(f"Error: {err}")  # Log the error
-            print(f"SQL: {sql}")
-            print(f"Data: {tuple(row)}")
-            st.error(f"⚠️ Error inserting data into {table_name}: {err}")
-        else:
-            print(f"Inserted row: {tuple(row)}")  # Log successful insertion
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-# ----------------- Delete All Data From Table ----------------- #
-def delete_all_data_from_table(table_name):
-    conn = connect_to_database()
-    cursor = conn.cursor()
-    cursor.execute(f"DELETE FROM {table_name}")
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-# ----------------- Clear Entire Database (Tables) ----------------- #
-def clear_database():
-    # List of all tables, including previous year tables
-    tables = [
-        "stock_summary", "sales_by_item", "purchases_by_item",
-        "stock_summary_previous", "sales_by_item_previous", "purchases_by_item_previous"
-    ]
-    for table in tables:
-        delete_all_data_from_table(table)
-
-# ----------------- Streamlit App ----------------- #
-st.set_page_config(page_title="General Report System", layout="wide")
-st.title("📦 General Report Dashboard")
-
-# Sidebar Actions
-with st.sidebar:
-    st.header("📤 Import CSV to Table")
-    # Dropdown to select the base table
-    base_table_option = st.selectbox("Select table", ["stock_summary", "sales_by_item", "purchases_by_item"])
-    # Dropdown to select the year (Current Year or Previous Year)
-    year_option = st.selectbox("Select Report Year", ["Current Year", "Previous Year"])
-
-    # Determine the target table based on the year option
-    table_option = base_table_option if year_option == "Current Year" else f"{base_table_option}_previous"
-
-    # File uploader for the CSV file
-    uploaded_file = st.file_uploader(f"Upload CSV File for {year_option} ({table_option})", type=["csv"])
-
-    # Button to upload the file to the database
-    if st.button("Upload to Database"):
-        if uploaded_file is not None:
-            # Pass the year option to the upload function
-            upload_csv_to_table(uploaded_file, base_table_option, year_option)
-            st.success(f"✅ Uploaded successfully to {table_option} for {year_option}!")
-        else:
-            st.warning("⚠️ Please upload a CSV file first.")
-
-    # Delete options
-    st.header("🗑️ Delete Options")
-    if st.button(f"Delete All Data in {table_option}"):
-        delete_all_data_from_table(table_option)
-        st.success(f"✅ All records deleted from {table_option}!")
-
-    if st.button("Clear Entire Database"):
-        clear_database()
-        st.success("✅ All tables cleared successfully!")
-
-# Main Report Display
-st.header("📊 General Report")
-
+# ----------------- Main ----------------- #
 if st.button("Generate Report"):
-    report_df = generate_general_report()
-    st.dataframe(report_df)
+    st.session_state.report_df = generate_general_report()
 
-    # Download Button
-    csv = report_df.to_csv(index=False)
-    st.download_button(
-        label="📥 Download Report as CSV",
-        data=csv,
-        file_name="general_report.csv",
-        mime="text/csv",
-    )
+if not st.session_state.report_df.empty:
+    rpt = st.session_state.report_df.copy()
+    st.subheader("📊 General Report")
+    st.dataframe(rpt)
 
-    # Optional Graph Section
-    st.subheader("📈 Sales Comparison (Current Year vs Previous Year)")
-    if "sales_comparison_percentage" in report_df.columns:
-        fig = px.bar(
-            report_df,
-            x="item_name",  # X-axis: Item names
-            y="sales_comparison_percentage",  # Y-axis: Sales comparison percentage
-            title="Sales Comparison (Current Year vs Previous Year)",
-            labels={"sales_comparison_percentage": "Sales Comparison (%)", "item_name": "Item Name"},
-            text="sales_comparison_percentage"  # Display percentage values on the bars
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    fmt = st.selectbox("Download General Report As", ["CSV","Excel","PDF"], key="fmt_gen")
+    if fmt == "CSV":
+        st.download_button("📥 Download CSV", df_to_csv_bytes(rpt), "general_report.csv", "text/csv")
+    elif fmt == "Excel":
+        st.download_button("📥 Download XLSX", df_to_excel_bytes(rpt), "general_report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     else:
-        st.warning("⚠️ The 'sales_comparison_percentage' column is missing from the report.")
+        st.download_button("📥 Download PDF", df_to_pdf_bytes(rpt), "general_report.pdf", "application/pdf")
+
+    if st.button("Generate P&S Forecast"):
+        f = rpt.rename(columns={
+            "purchase":"purchases",
+            "sales_current_year":"sales",
+            "sales_previous_year":"previous_sales"
+        })[[
+            "SKU","item_name","category","opening_balance","purchases","sales",
+            "sales_value_current_year","previous_sales","sales_value_previous_year",
+            "closing_balance","discrepancies"
+        ]].copy()
+
+        # forecast logic
+        f["max_forecast"] = (f[["sales","previous_sales"]].max(axis=1) / 25 * 75).clip(lower=0)
+        f["min_forecast"] = (f[["sales","previous_sales"]].min(axis=1) / 25 * 75).clip(lower=0)
+        f["avg_forecast"] = (f["max_forecast"] + f["min_forecast"]) / 2
+
+        f["max_purchase_forecast"] = (f["max_forecast"] - f["closing_balance"]).clip(lower=0)
+        f["min_purchase_forecast"] = (f["min_forecast"] - f["closing_balance"]).clip(lower=0)
+        f["avg_purchase_forecast"] = (f["max_purchase_forecast"] + f["min_purchase_forecast"]) / 2
+
+        # % Sales on stock
+        denom_stock = f["opening_balance"] + f["purchases"]
+        f["% Sales on stock"] = np.where(denom_stock == 0, 0, f["sales"] / denom_stock * 100)
+
+        # % sales difference
+        den = f["previous_sales"]
+        num = f["sales"]
+        f["% sales difference"] = np.where(
+            den == 0,
+            np.where(num > 0, 1000, 0),
+            np.where(
+                num == 0,
+                np.where(den > 0, -1000, 0),
+                (num - den) / den * 100
+            )
+        )
+
+        # format percentage columns
+        f["% Sales on stock"] = f["% Sales on stock"].round(2).astype(str) + "%"
+        f["% sales difference"] = f["% sales difference"].round(2).astype(str) + "%"
+
+        st.session_state.forecast_df = f
+        st.rerun()
+
+if not st.session_state.forecast_df.empty:
+    df = st.session_state.forecast_df.copy()
+    st.subheader("📈 P&S Forecast")
+    st.dataframe(df)
+
+    fmt2 = st.selectbox("Download P&S Forecast As", ["CSV","Excel","PDF"], key="fmt_ps")
+    if fmt2 == "CSV":
+        st.download_button("📥 Download CSV", df_to_csv_bytes(df), "ps_forecast.csv", "text/csv")
+    elif fmt2 == "Excel":
+        st.download_button("📥 Download XLSX", df_to_excel_bytes(df), "ps_forecast.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        st.download_button("📥 Download PDF", df_to_pdf_bytes(df), "ps_forecast.pdf", "application/pdf")
+
+    # Charts by category
+    cat_sales = df.groupby("category")["sales"].sum().reset_index()
+    fig1 = px.pie(cat_sales, names="category", values="sales", title="Current Year Sales by Category")
+    st.plotly_chart(fig1, use_container_width=True)
+
+    cat_prev = df.groupby("category")["previous_sales"].sum().reset_index()
+    fig2 = px.pie(cat_prev, names="category", values="previous_sales", title="Previous Year Sales by Category")
+    st.plotly_chart(fig2, use_container_width=True)
