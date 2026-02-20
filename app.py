@@ -4,6 +4,9 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import re
+import json
+import os
+from pathlib import Path
 from datetime import date, timedelta
 from io import BytesIO
 from fpdf import FPDF
@@ -14,11 +17,17 @@ import math
 # CONFIG
 # =====================================================
 st.set_page_config(page_title="Weekly Sales & Stock Report", layout="wide")
-st.title("📊 Weekly Sales & Stock Planning Report")
 
 CURRENT_YEAR = date.today().year
 WEEKS_IN_YEAR = 52
 MONTHS_IN_YEAR = 12
+
+# Paths for saved report data (committed to repo for sharing)
+DATA_DIR = Path(__file__).parent / "data"
+SAVED_REPORT_CSV = DATA_DIR / "report.csv"
+SAVED_REPORT_META = DATA_DIR / "report_meta.json"
+
+ADMIN_PASSWORD = "twc2026"  # Change this to your preferred password
 
 # =====================================================
 # HELPERS
@@ -141,7 +150,42 @@ def df_to_pdf(df):
 
 
 # =====================================================
-# SESSION STATE
+# ADMIN MODE CHECK
+# =====================================================
+# Sidebar: admin login
+st.sidebar.markdown("---")
+admin_pwd = st.sidebar.text_input("🔒 Admin Login", type="password", help="Enter admin password to upload data & generate reports")
+is_admin = (admin_pwd == ADMIN_PASSWORD)
+
+if is_admin:
+    st.sidebar.success("✅ Admin mode active")
+
+# =====================================================
+# LOAD SAVED REPORT (for viewer / shared dashboard)
+# =====================================================
+def load_saved_report():
+    """Load previously saved report from data/ folder."""
+    if SAVED_REPORT_CSV.exists() and SAVED_REPORT_META.exists():
+        try:
+            rpt = pd.read_csv(SAVED_REPORT_CSV)
+            with open(SAVED_REPORT_META, "r") as f:
+                meta = json.load(f)
+            return rpt, meta
+        except Exception:
+            return pd.DataFrame(), {}
+    return pd.DataFrame(), {}
+
+# Initialize report from saved data if available
+if "report" not in st.session_state or st.session_state.get("report", pd.DataFrame()).empty:
+    saved_rpt, saved_meta = load_saved_report()
+    if not saved_rpt.empty:
+        st.session_state["report"] = saved_rpt
+        st.session_state["health_stats"] = saved_meta.get("health_stats", {})
+        st.session_state["saved_report_week"] = saved_meta.get("report_week", 0)
+        st.session_state["saved_weeks_elapsed"] = saved_meta.get("weeks_elapsed", 0)
+
+# =====================================================
+# ADMIN: SESSION STATE
 # =====================================================
 _state_keys = {
     "sales_cy": pd.DataFrame(),
@@ -152,43 +196,52 @@ _state_keys = {
     "purchases_py": pd.DataFrame(),
     "twc_stock": pd.DataFrame(),
     "planning": pd.DataFrame(),
-    "report": pd.DataFrame(),
 }
 for k, default in _state_keys.items():
     if k not in st.session_state:
         st.session_state[k] = default.copy()
+if "report" not in st.session_state:
+    st.session_state["report"] = pd.DataFrame()
+# Default upload vars (only populated in admin mode)
+sales_cy_file = sales_py_file = stock_cy_file = stock_py_file = None
+purch_cy_file = purch_py_file = twc_file = planning_file = None
 
 # =====================================================
-# SIDEBAR — FILE UPLOADS
+# ADMIN: SIDEBAR — FILE UPLOADS
 # =====================================================
-st.sidebar.header("📁 Upload Weekly Data Files")
-st.sidebar.caption(
-    "Upload this week's exports. The system will auto-detect columns. "
-    "Files follow the naming pattern: *YTD {Month} week {N} {YY}*."
-)
+if is_admin:
+    st.title("📊 Weekly Sales & Stock Planning Report — Admin")
 
-# --- Sales files ---
-st.sidebar.subheader("Sales by Item (YTD)")
-sales_cy_file = st.sidebar.file_uploader("Current Year Sales", type=["csv", "xlsx"], key="up_sales_cy")
-sales_py_file = st.sidebar.file_uploader("Previous Year Sales", type=["csv", "xlsx"], key="up_sales_py")
+    st.sidebar.header("📁 Upload Weekly Data Files")
+    st.sidebar.caption(
+        "Upload this week's exports. The system will auto-detect columns. "
+        "Files follow the naming pattern: *YTD {Month} week {N} {YY}*."
+    )
 
-# --- Stock Summary files ---
-st.sidebar.subheader("Stock Summary (YTD)")
-stock_cy_file = st.sidebar.file_uploader("Current Year Stock Summary", type=["csv", "xlsx"], key="up_stock_cy")
-stock_py_file = st.sidebar.file_uploader("Previous Year Stock Summary", type=["csv", "xlsx"], key="up_stock_py")
+    # --- Sales files ---
+    st.sidebar.subheader("Sales by Item (YTD)")
+    sales_cy_file = st.sidebar.file_uploader("Current Year Sales", type=["csv", "xlsx"], key="up_sales_cy")
+    sales_py_file = st.sidebar.file_uploader("Previous Year Sales", type=["csv", "xlsx"], key="up_sales_py")
 
-# --- Purchases files ---
-st.sidebar.subheader("Purchases by Item (YTD)")
-purch_cy_file = st.sidebar.file_uploader("Current Year Purchases", type=["csv", "xlsx"], key="up_purch_cy")
-purch_py_file = st.sidebar.file_uploader("Previous Year Purchases", type=["csv", "xlsx"], key="up_purch_py")
+    # --- Stock Summary files ---
+    st.sidebar.subheader("Stock Summary (YTD)")
+    stock_cy_file = st.sidebar.file_uploader("Current Year Stock Summary", type=["csv", "xlsx"], key="up_stock_cy")
+    stock_py_file = st.sidebar.file_uploader("Previous Year Stock Summary", type=["csv", "xlsx"], key="up_stock_py")
 
-# --- TWC Stock ---
-st.sidebar.subheader("TWC Stock")
-twc_file = st.sidebar.file_uploader("TWC Stock Summary", type=["csv", "xlsx"], key="up_twc")
+    # --- Purchases files ---
+    st.sidebar.subheader("Purchases by Item (YTD)")
+    purch_cy_file = st.sidebar.file_uploader("Current Year Purchases", type=["csv", "xlsx"], key="up_purch_cy")
+    purch_py_file = st.sidebar.file_uploader("Previous Year Purchases", type=["csv", "xlsx"], key="up_purch_cy2")
 
-# --- Planning ---
-st.sidebar.subheader("Sales Planning / Targets")
-planning_file = st.sidebar.file_uploader("Stock Planning 2026 (XLSX)", type=["csv", "xlsx"], key="up_plan")
+    # --- TWC Stock ---
+    st.sidebar.subheader("TWC Stock")
+    twc_file = st.sidebar.file_uploader("TWC Stock Summary", type=["csv", "xlsx"], key="up_twc")
+
+    # --- Planning ---
+    st.sidebar.subheader("Sales Planning / Targets")
+    planning_file = st.sidebar.file_uploader("Stock Planning 2026 (XLSX)", type=["csv", "xlsx"], key="up_plan")
+else:
+    st.title("📊 Weekly Sales & Stock Planning Report")
 
 
 # =====================================================
@@ -392,7 +445,7 @@ def _process_planning(uploaded):
     st.session_state["planning"] = result
 
 
-# Run all processors
+# Run all processors (upload vars are None when not in admin mode — processors handle gracefully)
 _process_sales(sales_cy_file, "sales_cy")
 _process_sales(sales_py_file, "sales_py")
 _process_stock(stock_cy_file, "stock_cy")
@@ -404,43 +457,45 @@ _process_planning(planning_file)
 
 
 # =====================================================
-# REPORT PARAMETERS
+# ADMIN: REPORT PARAMETERS & GENERATE
 # =====================================================
-st.header("⚙️ Report Parameters")
+if is_admin:
 
-p1, p2, p3 = st.columns(3)
-with p1:
-    report_week = st.number_input(
-        "Report Week #", min_value=1, max_value=52,
-        value=week_number_now(),
-        help="ISO week number of this report",
+    st.header("⚙️ Report Parameters")
+
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        report_week = st.number_input(
+            "Report Week #", min_value=1, max_value=52,
+            value=week_number_now(),
+            help="ISO week number of this report",
+        )
+    with p2:
+        weeks_elapsed = st.number_input(
+            "Weeks Elapsed (YTD period)", min_value=1, max_value=52,
+            value=weeks_elapsed_in_year(),
+            help="Number of completed weeks in the YTD data",
+        )
+    with p3:
+        growth_pct = st.number_input(
+            "Growth Target (%)", min_value=0.0, max_value=200.0,
+            value=20.0,
+        ) / 100
+
+    months_elapsed = round(weeks_elapsed * 12 / 52, 2)
+    remaining_weeks = WEEKS_IN_YEAR - weeks_elapsed
+    remaining_months = round(remaining_weeks * 12 / 52, 2)
+
+    st.caption(
+        f"📅 Week {report_week} | {weeks_elapsed} weeks elapsed ≈ {months_elapsed:.1f} months | "
+        f"{remaining_weeks} weeks / {remaining_months:.1f} months remaining"
     )
-with p2:
-    weeks_elapsed = st.number_input(
-        "Weeks Elapsed (YTD period)", min_value=1, max_value=52,
-        value=weeks_elapsed_in_year(),
-        help="Number of completed weeks in the YTD data",
-    )
-with p3:
-    growth_pct = st.number_input(
-        "Growth Target (%)", min_value=0.0, max_value=200.0,
-        value=20.0,
-    ) / 100
-
-months_elapsed = round(weeks_elapsed * 12 / 52, 2)
-remaining_weeks = WEEKS_IN_YEAR - weeks_elapsed
-remaining_months = round(remaining_weeks * 12 / 52, 2)
-
-st.caption(
-    f"📅 Week {report_week} | {weeks_elapsed} weeks elapsed ≈ {months_elapsed:.1f} months | "
-    f"{remaining_weeks} weeks / {remaining_months:.1f} months remaining"
-)
 
 
 # =====================================================
-# GENERATE REPORT
+# GENERATE REPORT (Admin only)
 # =====================================================
-if st.button("🚀 Generate Weekly Report", type="primary"):
+if is_admin and st.button("🚀 Generate Weekly Report", type="primary"):
 
     # ── Validate minimum inputs ──
     if st.session_state.sales_cy.empty:
@@ -695,16 +750,44 @@ if st.button("🚀 Generate Weekly Report", type="primary"):
         "neg_bonded_count": _neg_bonded,
     }
 
+    # Save report_week to session state for dashboard display
+    st.session_state["saved_report_week"] = report_week
+    st.session_state["saved_weeks_elapsed"] = weeks_elapsed
+
+# ── Save for Sharing button (Admin only) ──
+if is_admin and not st.session_state.get("report", pd.DataFrame()).empty:
+    st.markdown("---")
+    if st.button("💾 Save Report for Sharing", help="Saves report to data/ folder. Then git push to update the shared dashboard."):
+        DATA_DIR.mkdir(exist_ok=True)
+        rpt_to_save = st.session_state["report"]
+        rpt_to_save.to_csv(SAVED_REPORT_CSV, index=False)
+        meta = {
+            "report_week": int(st.session_state.get("saved_report_week", week_number_now())),
+            "weeks_elapsed": int(st.session_state.get("saved_weeks_elapsed", weeks_elapsed_in_year())),
+            "health_stats": st.session_state.get("health_stats", {}),
+            "saved_date": str(date.today()),
+        }
+        with open(SAVED_REPORT_META, "w") as f:
+            json.dump(meta, f, indent=2)
+        st.success(
+            f"✅ Report saved to `data/` folder!\n\n"
+            f"Now run in terminal:\n```\ngit add data/\ngit commit -m \"Update weekly report\"\ngit push\n```\n"
+            f"Streamlit Cloud will auto-redeploy with the new data."
+        )
+
 
 # =====================================================
 # OUTPUT DASHBOARD
 # =====================================================
-rpt = st.session_state.report
-if not rpt.empty:
+# Determine report_week for display (from admin input or saved metadata)
+report_week_display = st.session_state.get("saved_report_week", week_number_now())
+
+rpt = st.session_state.get("report", pd.DataFrame())
+if isinstance(rpt, pd.DataFrame) and not rpt.empty:
     hs = st.session_state.get("health_stats", {})
 
     # ── Top-level KPIs ──
-    st.header(f"📋 Weekly Report — Week {report_week}")
+    st.header(f"📋 Weekly Report — Week {report_week_display}")
     st.markdown("---")
 
     st.subheader("🔑 Key Performance Indicators")
@@ -987,7 +1070,7 @@ if not rpt.empty:
     # ── Downloads ──
     st.subheader("⬇️ Download Report")
     dl1, dl2, dl3 = st.columns(3)
-    filename_base = f"weekly_report_wk{report_week}_{CURRENT_YEAR}"
+    filename_base = f"weekly_report_wk{report_week_display}_{CURRENT_YEAR}"
     with dl1:
         st.download_button(
             "📄 CSV", rpt.to_csv(index=False),
@@ -1004,3 +1087,6 @@ if not rpt.empty:
             "📑 PDF", df_to_pdf(rpt),
             f"{filename_base}.pdf", "application/pdf",
         )
+else:
+    if not is_admin:
+        st.info("📊 No report data available yet. The report will appear here once it has been published.")
