@@ -761,10 +761,13 @@ if is_admin and not st.session_state.get("report", pd.DataFrame()).empty:
         DATA_DIR.mkdir(exist_ok=True)
         rpt_to_save = st.session_state["report"]
         rpt_to_save.to_csv(SAVED_REPORT_CSV, index=False)
+        # Convert numpy types to native Python for JSON serialization
+        hs_raw = st.session_state.get("health_stats", {})
+        hs_clean = {k: int(v) if isinstance(v, (np.integer,)) else float(v) if isinstance(v, (np.floating,)) else v for k, v in hs_raw.items()}
         meta = {
             "report_week": int(st.session_state.get("saved_report_week", week_number_now())),
             "weeks_elapsed": int(st.session_state.get("saved_weeks_elapsed", weeks_elapsed_in_year())),
-            "health_stats": st.session_state.get("health_stats", {}),
+            "health_stats": hs_clean,
             "saved_date": str(date.today()),
         }
         with open(SAVED_REPORT_META, "w") as f:
