@@ -1,4 +1,6 @@
 streamlit
-mysql-connector-python
 pandas
 plotly
+numpy
+openpyxl
+fpdf2

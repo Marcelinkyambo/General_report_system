@@ -1,0 +1,23 @@
+# Virtual environments
+.venv*/
+venv*/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Data files (uploaded by users, not needed in repo)
+files/
+app files/
+visuals/
+
+# IDE
+.vscode/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Excel planning files
+*.xlsx
