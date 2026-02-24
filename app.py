@@ -612,6 +612,9 @@ if is_admin and st.button("🚀 Generate Weekly Report", type="primary"):
     # ── Weekly run rate ──
     df["weekly_run_rate"] = safe_div(df["quantity_sold"], weeks_elapsed)
     df["py_weekly_run_rate"] = safe_div(df["py_sales"], weeks_elapsed)
+    remaining_weeks_safe = max(remaining_weeks, 0)
+    df["bonded_est_reorder_qty"] = df["weekly_run_rate"] * remaining_weeks_safe
+    df["twc_est_reorder_qty"] = df["weekly_run_rate"] * remaining_weeks_safe
 
     # ── Monthly Sales Target (from planning or fallback) ──
     if has_planning and "monthly_target_plan" in df.columns:
@@ -721,6 +724,8 @@ if is_admin and st.button("🚀 Generate Weekly Report", type="primary"):
         "Stockout Risk": df["stockout_risk"],
         "Bonded Reorder": df["bonded_reorder"],
         "TWC Reorder": df["twc_reorder"],
+        "Bonded Est. Reorder Qty": df["bonded_est_reorder_qty"],
+        "TWC Est. Reorder Qty": df["twc_est_reorder_qty"],
         # Purchases
         "CY Purchases": df["purchases_cy"],
         "PY Purchases": df["purchases_py"],
@@ -922,10 +927,13 @@ if isinstance(rpt, pd.DataFrame) and not rpt.empty:
                     "SKU", "Item Name", "Weekly Run Rate", "Total Stock",
                     "TWC Stock", "Bonded Stock", "Wks Until Stockout",
                     "Stock Coverage (Mo)", "Bonded Reorder", "TWC Reorder",
+                    "Bonded Est. Reorder Qty", "TWC Est. Reorder Qty",
                 ]].style.format({
                     "Weekly Run Rate": lambda x: "" if pd.isna(x) else f"{x:,.1f}",
                     "Wks Until Stockout": lambda x: "" if pd.isna(x) else f"{x:,.1f}",
                     "Stock Coverage (Mo)": lambda x: "" if pd.isna(x) else f"{x:,.1f}",
+                    "Bonded Est. Reorder Qty": lambda x: "" if pd.isna(x) else f"{x:,.0f}",
+                    "TWC Est. Reorder Qty": lambda x: "" if pd.isna(x) else f"{x:,.0f}",
                 }),
                 use_container_width=True,
             )
@@ -938,10 +946,11 @@ if isinstance(rpt, pd.DataFrame) and not rpt.empty:
             st.dataframe(
                 bonded_ro[[
                     "SKU", "Item Name", "Total Stock", "Bonded Stock",
-                    "Stock Coverage (Mo)", "Monthly Target",
+                    "Stock Coverage (Mo)", "Monthly Target", "Bonded Est. Reorder Qty",
                 ]].style.format({
                     "Stock Coverage (Mo)": lambda x: "" if pd.isna(x) else f"{x:,.1f}",
                     "Monthly Target": lambda x: "" if pd.isna(x) else f"{x:,.1f}",
+                    "Bonded Est. Reorder Qty": lambda x: "" if pd.isna(x) else f"{x:,.0f}",
                 }),
                 use_container_width=True,
             )
@@ -954,10 +963,11 @@ if isinstance(rpt, pd.DataFrame) and not rpt.empty:
             st.dataframe(
                 twc_ro[[
                     "SKU", "Item Name", "TWC Stock", "Bonded Stock",
-                    "TWC Coverage (Mo)", "Monthly Target",
+                    "TWC Coverage (Mo)", "Monthly Target", "TWC Est. Reorder Qty",
                 ]].style.format({
                     "TWC Coverage (Mo)": lambda x: "" if pd.isna(x) else f"{x:,.1f}",
                     "Monthly Target": lambda x: "" if pd.isna(x) else f"{x:,.1f}",
+                    "TWC Est. Reorder Qty": lambda x: "" if pd.isna(x) else f"{x:,.0f}",
                 }),
                 use_container_width=True,
             )
@@ -1067,6 +1077,8 @@ if isinstance(rpt, pd.DataFrame) and not rpt.empty:
         "Wks Until Stockout": lambda x: "" if pd.isna(x) else f"{x:.1f}",
         "Stock Turnover": lambda x: "" if pd.isna(x) else f"{x:.2f}",
         "Weekly Run Rate": lambda x: "" if pd.isna(x) else f"{x:.1f}",
+        "Bonded Est. Reorder Qty": lambda x: "" if pd.isna(x) else f"{x:,.0f}",
+        "TWC Est. Reorder Qty": lambda x: "" if pd.isna(x) else f"{x:,.0f}",
     }
     st.dataframe(rpt.style.format(fmt_full), use_container_width=True)
 
