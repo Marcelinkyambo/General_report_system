@@ -613,8 +613,7 @@ if is_admin and st.button("🚀 Generate Weekly Report", type="primary"):
     df["weekly_run_rate"] = safe_div(df["quantity_sold"], weeks_elapsed)
     df["py_weekly_run_rate"] = safe_div(df["py_sales"], weeks_elapsed)
     remaining_weeks_safe = max(remaining_weeks, 0)
-    df["bonded_est_reorder_qty"] = df["weekly_run_rate"] * remaining_weeks_safe
-    df["twc_est_reorder_qty"] = df["weekly_run_rate"] * remaining_weeks_safe
+    df["remaining_year_demand"] = df["weekly_run_rate"] * remaining_weeks_safe
 
     # ── Monthly Sales Target (from planning or fallback) ──
     if has_planning and "monthly_target_plan" in df.columns:
@@ -665,16 +664,20 @@ if is_admin and st.button("🚀 Generate Weekly Report", type="primary"):
     df["stock_turnover"] = safe_div(df["qty_out_cy"], df["opening_stock_cy"])
 
     # ── Reorder flags (based on current-sales coverage) ──
-    # Total stock: reorder when coverage is 4 months or less
+    # Total stock: reorder when coverage is 5 months or less
     # TWC stock: reorder when coverage is 1 month or less
     df["bonded_reorder"] = np.where(
-        df["total_stock_coverage_months"].notna() & (df["total_stock_coverage_months"] <= 4),
+        df["total_stock_coverage_months"].notna() & (df["total_stock_coverage_months"] <= 5),
         "REORDER", "",
     )
     df["twc_reorder"] = np.where(
         df["twc_coverage_months"].notna() & (df["twc_coverage_months"] <= 1),
         "REORDER", "",
     )
+    bonded_gap = np.maximum(df["remaining_year_demand"] - df["total_stock"], 0)
+    twc_gap = np.maximum(df["remaining_year_demand"] - df["twc_stock"], 0)
+    df["bonded_est_reorder_qty"] = np.where(df["bonded_reorder"] == "REORDER", np.ceil(bonded_gap), 0)
+    df["twc_est_reorder_qty"] = np.where(df["twc_reorder"] == "REORDER", np.ceil(twc_gap), 0)
 
     # ── Projected stock-out week ──
     df["weeks_until_stockout"] = np.where(
@@ -1058,7 +1061,7 @@ if isinstance(rpt, pd.DataFrame) and not rpt.empty:
             title="Each dot = 1 SKU: are you selling fast enough AND have enough stock?",
         )
         fig_scatter.add_vline(x=1.0, line_dash="dash", line_color="gray", annotation_text="100% Pace")
-        fig_scatter.add_hline(y=4.0, line_dash="dash", line_color="gray", annotation_text="4-Mo Coverage")
+        fig_scatter.add_hline(y=5.0, line_dash="dash", line_color="gray", annotation_text="5-Mo Coverage")
         fig_scatter.update_layout(height=500)
         st.plotly_chart(fig_scatter, use_container_width=True)
 
