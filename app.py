@@ -54,13 +54,24 @@ def normalize_sku(sku):
     s = str(sku).strip()
     if s.endswith(".0"):
         s = s[:-2]
-    parts = s.split("-")
-    return "-".join(parts[:2]) if len(parts) >= 2 else s
+    parts = [p.strip() for p in s.split("-") if p is not None]
+    if len(parts) >= 2:
+        p1, p2 = parts[0], parts[1]
+        if p1.isdigit():
+            p1 = p1.zfill(3)
+        if p2.isdigit():
+            p2 = p2.zfill(3)
+        return f"{p1}-{p2}"
+    return s
 
 
 def sku_to_group_key(sku):
     """Numeric-only 6-digit key for grouping (e.g. '047003')."""
-    return re.sub(r"[^0-9]", "", str(sku))[:6].zfill(6)
+    s = normalize_sku(sku)
+    parts = s.split("-")
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        return f"{parts[0].zfill(3)}{parts[1].zfill(3)}"
+    return re.sub(r"[^0-9]", "", str(s))[:6].zfill(6)
 
 
 def read_uploaded(uploaded_file):
@@ -86,15 +97,35 @@ def safe_div(a, b, fill=np.nan):
     """Element-wise a/b, returning *fill* where b == 0 or NaN."""
     return np.where((b > 0) & np.isfinite(b), a / b, fill)
 
+def first_non_empty(values):
+    """Return first meaningful (non-empty) value from a Series-like input."""
+    for v in values:
+        if pd.isna(v):
+            continue
+        s = str(v).strip()
+        if s and s.lower() not in {"nan", "none", "null", "--"}:
+            return s
+    return np.nan
+
+def item_name_key(name):
+    """Normalize item names for metadata lookup across vintage/format variants."""
+    if pd.isna(name):
+        return ""
+    s = str(name).lower().strip()
+    s = s.replace("#vintage#", " ")
+    s = re.sub(r"\b(19|20)\d{2}\b", " ", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
 
 def health_label(pace):
     if pd.isna(pace):
         return ""
-    if pace >= 1.10:
+    if pace >= 0.10:
         return "🟢 Ahead"
-    if pace >= 0.90:
+    if pace >= -0.10:
         return "🟡 On Track"
-    if pace >= 0.70:
+    if pace >= -0.30:
         return "🟠 Behind"
     return "🔴 Critical"
 
@@ -195,6 +226,7 @@ _state_keys = {
     "purchases_cy": pd.DataFrame(),
     "purchases_py": pd.DataFrame(),
     "twc_stock": pd.DataFrame(),
+    "item_details": pd.DataFrame(),
     "planning": pd.DataFrame(),
 }
 for k, default in _state_keys.items():
@@ -204,7 +236,7 @@ if "report" not in st.session_state:
     st.session_state["report"] = pd.DataFrame()
 # Default upload vars (only populated in admin mode)
 sales_cy_file = sales_py_file = stock_cy_file = stock_py_file = None
-purch_cy_file = purch_py_file = twc_file = planning_file = None
+purch_cy_file = purch_py_file = twc_file = item_details_file = planning_file = None
 
 # =====================================================
 # ADMIN: SIDEBAR — FILE UPLOADS
@@ -237,6 +269,15 @@ if is_admin:
     st.sidebar.subheader("TWC Stock")
     twc_file = st.sidebar.file_uploader("TWC Stock Summary", type=["csv", "xlsx"], key="up_twc")
 
+    # --- Item Details (metadata) ---
+    st.sidebar.subheader("Item Details (Optional)")
+    item_details_file = st.sidebar.file_uploader(
+        "Item Details / Master",
+        type=["csv", "xlsx"],
+        key="up_item_details",
+        help="Optional file containing SKU/Item Name with Brand and Country of Origin.",
+    )
+
     # --- Planning ---
     st.sidebar.subheader("Sales Planning / Targets")
     planning_file = st.sidebar.file_uploader("Stock Planning 2026 (XLSX)", type=["csv", "xlsx"], key="up_plan")
@@ -265,25 +306,25 @@ def _process_sales(uploaded, state_key):
         st.sidebar.error(f"Cannot detect SKU or Quantity column in {uploaded.name}")
         return
 
-    raw["_sku_grp"] = raw[sku_col].apply(sku_to_group_key)
-    raw = raw[raw["_sku_grp"].str.replace("0", "") != ""].copy()
     raw["_sku"] = raw[sku_col].apply(normalize_sku)
+    raw["_sku_grp"] = raw["_sku"].apply(sku_to_group_key)
+    raw = raw[raw["_sku_grp"].str.replace("0", "") != ""].copy()
     raw["_qty"] = pd.to_numeric(raw[qty_col], errors="coerce").fillna(0)
     raw["_amt"] = pd.to_numeric(raw[amt_col], errors="coerce").fillna(0) if amt_col else 0
 
-    agg = {"_sku": "first", "_qty": "sum", "_amt": "sum"}
+    agg = {"_sku": first_non_empty, "_qty": "sum", "_amt": "sum"}
     if item_col:
         raw["_item"] = raw[item_col]
-        agg["_item"] = "first"
+        agg["_item"] = first_non_empty
     if cat_col:
         raw["_cat"] = raw[cat_col]
-        agg["_cat"] = "first"
+        agg["_cat"] = first_non_empty
     if origin_col:
         raw["_origin"] = raw[origin_col]
-        agg["_origin"] = "first"
+        agg["_origin"] = first_non_empty
     if brand_col:
         raw["_brand"] = raw[brand_col]
-        agg["_brand"] = "first"
+        agg["_brand"] = first_non_empty
 
     grouped = raw.groupby("_sku_grp", as_index=False).agg(agg)
     grouped.rename(columns={
@@ -311,14 +352,16 @@ def _process_stock(uploaded, state_key):
     qty_out_col = find_col(raw, ["quantity_out"], ["amount"]) or find_col(raw, ["qty_out"])
     cat_col = find_col(raw, ["category_name"])
     item_col = find_col(raw, ["item", "name"]) or find_col(raw, ["item_name"])
+    origin_col = find_col(raw, ["country"]) or find_col(raw, ["origin"])
+    brand_col = find_col(raw, ["brand"])
 
     if not sku_col or not close_col:
         st.sidebar.error(f"Cannot detect SKU or Closing Stock column in {uploaded.name}")
         return
 
-    raw["_sku_grp"] = raw[sku_col].apply(sku_to_group_key)
-    raw = raw[raw["_sku_grp"].str.replace("0", "") != ""].copy()
     raw["_sku"] = raw[sku_col].apply(normalize_sku)
+    raw["_sku_grp"] = raw["_sku"].apply(sku_to_group_key)
+    raw = raw[raw["_sku_grp"].str.replace("0", "") != ""].copy()
 
     for src, tgt in [
         (open_col, "_opening"), (close_col, "_closing"),
@@ -329,19 +372,26 @@ def _process_stock(uploaded, state_key):
         else:
             raw[tgt] = 0
 
-    agg = {"_sku": "first", "_opening": "sum", "_closing": "sum", "_qty_in": "sum", "_qty_out": "sum"}
+    agg = {"_sku": first_non_empty, "_opening": "sum", "_closing": "sum", "_qty_in": "sum", "_qty_out": "sum"}
     if item_col:
         raw["_item"] = raw[item_col]
-        agg["_item"] = "first"
+        agg["_item"] = first_non_empty
     if cat_col:
         raw["_cat"] = raw[cat_col]
-        agg["_cat"] = "first"
+        agg["_cat"] = first_non_empty
+    if origin_col:
+        raw["_origin"] = raw[origin_col]
+        agg["_origin"] = first_non_empty
+    if brand_col:
+        raw["_brand"] = raw[brand_col]
+        agg["_brand"] = first_non_empty
 
     grouped = raw.groupby("_sku_grp", as_index=False).agg(agg)
     grouped.rename(columns={
         "_sku_grp": "sku_key", "_sku": "sku", "_opening": "opening_stock",
         "_closing": "closing_stock", "_qty_in": "qty_in", "_qty_out": "qty_out",
-        "_item": "item_name", "_cat": "category",
+        "_item": "item_name", "_cat": "category", "_origin": "country_of_origin",
+        "_brand": "brand",
     }, inplace=True)
 
     st.session_state[state_key] = grouped
@@ -355,23 +405,41 @@ def _process_purchases(uploaded, state_key):
     sku_col = find_col(raw, ["sku"])
     qty_col = find_col(raw, ["quantity_purchased"]) or find_col(raw, ["quantity"])
     amt_col = find_col(raw, ["amount"], ["stock", "opening", "closing"])
+    item_col = find_col(raw, ["item", "name"]) or find_col(raw, ["item_name"])
+    cat_col = find_col(raw, ["category_name"])
+    origin_col = find_col(raw, ["country"]) or find_col(raw, ["origin"])
+    brand_col = find_col(raw, ["brand"])
 
     if not sku_col or not qty_col:
         st.sidebar.error(f"Cannot detect SKU or Quantity column in {uploaded.name}")
         return
 
-    raw["_sku_grp"] = raw[sku_col].apply(sku_to_group_key)
-    raw = raw[raw["_sku_grp"].str.replace("0", "") != ""].copy()
     raw["_sku"] = raw[sku_col].apply(normalize_sku)
+    raw["_sku_grp"] = raw["_sku"].apply(sku_to_group_key)
+    raw = raw[raw["_sku_grp"].str.replace("0", "") != ""].copy()
     raw["_qty"] = pd.to_numeric(raw[qty_col], errors="coerce").fillna(0)
     raw["_amt"] = pd.to_numeric(raw[amt_col], errors="coerce").fillna(0) if amt_col else 0
 
-    grouped = raw.groupby("_sku_grp", as_index=False).agg({
-        "_sku": "first", "_qty": "sum", "_amt": "sum",
-    })
+    agg = {"_sku": first_non_empty, "_qty": "sum", "_amt": "sum"}
+    if item_col:
+        raw["_item"] = raw[item_col]
+        agg["_item"] = first_non_empty
+    if cat_col:
+        raw["_cat"] = raw[cat_col]
+        agg["_cat"] = first_non_empty
+    if origin_col:
+        raw["_origin"] = raw[origin_col]
+        agg["_origin"] = first_non_empty
+    if brand_col:
+        raw["_brand"] = raw[brand_col]
+        agg["_brand"] = first_non_empty
+
+    grouped = raw.groupby("_sku_grp", as_index=False).agg(agg)
     grouped.rename(columns={
         "_sku_grp": "sku_key", "_sku": "sku",
         "_qty": "quantity_purchased", "_amt": "purchase_amount",
+        "_item": "item_name", "_cat": "category", "_origin": "country_of_origin",
+        "_brand": "brand",
     }, inplace=True)
 
     st.session_state[state_key] = grouped
@@ -389,23 +457,107 @@ def _process_twc(uploaded):
         or find_col(raw, ["closing"], ["amount"])
         or find_col(raw, ["stock"], ["amount", "opening"])
     )
+    item_col = find_col(raw, ["item", "name"]) or find_col(raw, ["item_name"])
+    cat_col = find_col(raw, ["category_name"])
+    origin_col = find_col(raw, ["country"]) or find_col(raw, ["origin"])
+    brand_col = find_col(raw, ["brand"])
     if not sku_col or not close_col:
         st.sidebar.error(f"Cannot detect SKU or Stock column in {uploaded.name}")
         return
 
-    raw["_sku_grp"] = raw[sku_col].apply(sku_to_group_key)
-    raw = raw[raw["_sku_grp"].str.replace("0", "") != ""].copy()
     raw["_sku"] = raw[sku_col].apply(normalize_sku)
+    raw["_sku_grp"] = raw["_sku"].apply(sku_to_group_key)
+    raw = raw[raw["_sku_grp"].str.replace("0", "") != ""].copy()
     raw[close_col] = pd.to_numeric(
         raw[close_col].replace("--", 0), errors="coerce"
     ).fillna(0)
 
-    grouped = (
-        raw.groupby("_sku_grp", as_index=False)
-        .agg({close_col: "sum", "_sku": "first"})
-        .rename(columns={"_sku_grp": "sku_key", close_col: "twc_stock", "_sku": "sku"})
-    )
+    agg = {close_col: "sum", "_sku": first_non_empty}
+    if item_col:
+        raw["_item"] = raw[item_col]
+        agg["_item"] = first_non_empty
+    if cat_col:
+        raw["_cat"] = raw[cat_col]
+        agg["_cat"] = first_non_empty
+    if origin_col:
+        raw["_origin"] = raw[origin_col]
+        agg["_origin"] = first_non_empty
+    if brand_col:
+        raw["_brand"] = raw[brand_col]
+        agg["_brand"] = first_non_empty
+
+    grouped = raw.groupby("_sku_grp", as_index=False).agg(agg)
+    grouped.rename(columns={
+        "_sku_grp": "sku_key", close_col: "twc_stock", "_sku": "sku",
+        "_item": "item_name", "_cat": "category", "_origin": "country_of_origin",
+        "_brand": "brand",
+    }, inplace=True)
     st.session_state["twc_stock"] = grouped
+
+
+def _process_item_details(uploaded):
+    """Read optional item-details/master file for metadata backfill."""
+    if uploaded is None:
+        return
+    raw = read_uploaded(uploaded)
+    sku_col = find_col(raw, ["sku"])
+    item_col = find_col(raw, ["item", "name"]) or find_col(raw, ["item_name"]) or find_col(raw, ["name"])
+    cat_col = find_col(raw, ["category_name"]) or find_col(raw, ["category"])
+    origin_col = find_col(raw, ["country"]) or find_col(raw, ["origin"])
+    brand_col = find_col(raw, ["brand"])
+
+    if not sku_col and not item_col:
+        st.sidebar.error(f"Cannot detect SKU or Item Name column in {uploaded.name}")
+        return
+    if not any([cat_col, origin_col, brand_col]):
+        st.sidebar.error(f"No metadata columns found (category/country/brand) in {uploaded.name}")
+        return
+
+    work = raw.copy()
+    agg = {}
+
+    if sku_col:
+        work["_sku"] = work[sku_col].apply(normalize_sku)
+        work["_sku_grp"] = work["_sku"].apply(sku_to_group_key)
+        work = work[work["_sku_grp"].str.replace("0", "") != ""].copy()
+        agg["_sku"] = first_non_empty
+    if item_col:
+        work["_item"] = work[item_col]
+        work["_item_key"] = work["_item"].apply(item_name_key)
+        agg["_item"] = first_non_empty
+        if sku_col:
+            agg["_item_key"] = first_non_empty
+    if cat_col:
+        work["_cat"] = work[cat_col]
+        agg["_cat"] = first_non_empty
+    if origin_col:
+        work["_origin"] = work[origin_col]
+        agg["_origin"] = first_non_empty
+    if brand_col:
+        work["_brand"] = work[brand_col]
+        agg["_brand"] = first_non_empty
+
+    if sku_col:
+        grouped = work.groupby("_sku_grp", as_index=False).agg(agg)
+        grouped.rename(columns={"_sku_grp": "sku_key"}, inplace=True)
+    else:
+        if "_item_key" not in work.columns:
+            st.sidebar.error(f"Cannot build metadata keys from {uploaded.name}")
+            return
+        work = work[work["_item_key"].astype(str).str.len() > 0].copy()
+        grouped = work.groupby("_item_key", as_index=False).agg(agg)
+        grouped.rename(columns={"_item_key": "item_name_key"}, inplace=True)
+
+    grouped.rename(columns={
+        "_sku": "sku",
+        "_item": "item_name",
+        "_item_key": "item_name_key",
+        "_cat": "category",
+        "_origin": "country_of_origin",
+        "_brand": "brand",
+    }, inplace=True)
+
+    st.session_state["item_details"] = grouped
 
 
 def _process_planning(uploaded):
@@ -453,6 +605,7 @@ _process_stock(stock_py_file, "stock_py")
 _process_purchases(purch_cy_file, "purchases_cy")
 _process_purchases(purch_py_file, "purchases_py")
 _process_twc(twc_file)
+_process_item_details(item_details_file)
 _process_planning(planning_file)
 
 
@@ -586,6 +739,123 @@ if is_admin and st.button("🚀 Generate Weekly Report", type="primary"):
         plan_cols = [c for c in plan.columns if c != "sku"]
         df = df.merge(plan[plan_cols], on="sku_key", how="left")
 
+    # ── Metadata backfill from all uploaded sources ──
+    metadata_cols = ["sku", "item_name", "category", "country_of_origin", "brand"]
+    metadata_sources = []
+    for state_key in ["sales_cy", "sales_py", "stock_cy", "stock_py", "purchases_cy", "purchases_py", "twc_stock", "item_details"]:
+        src = st.session_state.get(state_key, pd.DataFrame())
+        if not isinstance(src, pd.DataFrame) or src.empty or "sku_key" not in src.columns:
+            continue
+        cols = ["sku_key"] + [c for c in metadata_cols if c in src.columns]
+        if len(cols) > 1:
+            metadata_sources.append(src[cols].copy())
+
+    if metadata_sources:
+        meta_all = pd.concat(metadata_sources, ignore_index=True, sort=False)
+        meta_agg_spec = {}
+        for col in metadata_cols:
+            if col in meta_all.columns:
+                meta_agg_spec[col] = first_non_empty
+        meta = meta_all.groupby("sku_key", as_index=False).agg(meta_agg_spec)
+        df = df.merge(meta, on="sku_key", how="left", suffixes=("", "_meta"))
+
+        for col in metadata_cols:
+            meta_col = f"{col}_meta"
+            if meta_col not in df.columns:
+                continue
+            if col in df.columns:
+                current = df[col]
+                current_text = current.astype(str).str.strip().str.lower()
+                missing_mask = current.isna() | current_text.isin(["", "nan", "none", "null", "--"])
+                df[col] = np.where(missing_mask, df[meta_col], current)
+            else:
+                df[col] = df[meta_col]
+            df.drop(columns=[meta_col], inplace=True)
+
+    # ── Metadata enrichment for non-sales items ──
+    for col in ["brand", "country_of_origin"]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    if "item_name" in df.columns:
+        df["_item_name_key"] = df["item_name"].apply(item_name_key)
+        has_key = df["_item_name_key"].astype(str).str.len() > 0
+        has_brand = df["brand"].notna() & ~df["brand"].astype(str).str.strip().str.lower().isin(["", "nan", "none", "null", "--"])
+        has_country = df["country_of_origin"].notna() & ~df["country_of_origin"].astype(str).str.strip().str.lower().isin(["", "nan", "none", "null", "--"])
+
+        by_name_sources = []
+        base_name_cols = ["_item_name_key"]
+        if has_brand.any():
+            base_name_cols.append("brand")
+        if has_country.any():
+            base_name_cols.append("country_of_origin")
+        if len(base_name_cols) > 1:
+            by_name_sources.append(df.loc[has_key, base_name_cols].copy())
+
+        details = st.session_state.get("item_details", pd.DataFrame())
+        if isinstance(details, pd.DataFrame) and not details.empty:
+            details_name = details.copy()
+            if "item_name_key" not in details_name.columns and "item_name" in details_name.columns:
+                details_name["item_name_key"] = details_name["item_name"].apply(item_name_key)
+            if "item_name_key" in details_name.columns:
+                dcols = ["item_name_key"]
+                if "brand" in details_name.columns:
+                    dcols.append("brand")
+                if "country_of_origin" in details_name.columns:
+                    dcols.append("country_of_origin")
+                if len(dcols) > 1:
+                    dn = details_name[dcols].copy().rename(columns={"item_name_key": "_item_name_key"})
+                    dn = dn[dn["_item_name_key"].astype(str).str.len() > 0]
+                    by_name_sources.append(dn)
+
+        if by_name_sources:
+            by_name_all = pd.concat(by_name_sources, ignore_index=True, sort=False)
+            by_name_spec = {}
+            if "brand" in by_name_all.columns:
+                by_name_spec["brand"] = first_non_empty
+            if "country_of_origin" in by_name_all.columns:
+                by_name_spec["country_of_origin"] = first_non_empty
+            by_name = (
+                by_name_all
+                .groupby("_item_name_key", as_index=False)
+                .agg(by_name_spec)
+                .rename(columns={"brand": "_brand_by_name", "country_of_origin": "_country_by_name"})
+            )
+            df = df.merge(by_name, on="_item_name_key", how="left")
+            if "_brand_by_name" in df.columns:
+                brand_missing = ~has_brand
+                df["brand"] = np.where(brand_missing, df["_brand_by_name"], df["brand"])
+                df.drop(columns=["_brand_by_name"], inplace=True)
+            if "_country_by_name" in df.columns:
+                country_missing = ~has_country
+                df["country_of_origin"] = np.where(country_missing, df["_country_by_name"], df["country_of_origin"])
+                df.drop(columns=["_country_by_name"], inplace=True)
+
+        df.drop(columns=["_item_name_key"], inplace=True)
+
+    # Fill country from known brand-country pairs where possible
+    brand_vals = df["brand"].astype(str).str.strip()
+    country_vals = df["country_of_origin"].astype(str).str.strip()
+    valid_brand = df["brand"].notna() & ~brand_vals.str.lower().isin(["", "nan", "none", "null", "--"])
+    valid_country = df["country_of_origin"].notna() & ~country_vals.str.lower().isin(["", "nan", "none", "null", "--"])
+    brand_country = (
+        df[valid_brand & valid_country]
+        .groupby("brand", as_index=False)
+        .agg({"country_of_origin": first_non_empty})
+        .rename(columns={"country_of_origin": "_country_by_brand"})
+    )
+    if not brand_country.empty:
+        df = df.merge(brand_country, on="brand", how="left")
+        country_missing = ~valid_country
+        df["country_of_origin"] = np.where(country_missing, df["_country_by_brand"], df["country_of_origin"])
+        df.drop(columns=["_country_by_brand"], inplace=True)
+
+    # Ensure report columns always exist (explicit fallback if unknown)
+    for col in ["brand", "country_of_origin"]:
+        vals = df[col].astype(str).str.strip()
+        missing = df[col].isna() | vals.str.lower().isin(["", "nan", "none", "null", "--"])
+        df[col] = np.where(missing, "Unknown", df[col])
+
     # ── Fill NaN numerics ──
     num_fills = {
         "total_stock": 0, "total_stock_py": 0, "twc_stock": 0,
@@ -597,12 +867,13 @@ if is_admin and st.button("🚀 Generate Weekly Report", type="primary"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(fill)
 
-    # ── Derived: bonded stock ──
-    df["twc_stock"] = df["twc_stock"].fillna(0)
-    df["bonded_stock_raw"] = df["total_stock"] - df["twc_stock"]
-    # Clamp to 0 — negative values arise from TWC/Stock report timing mismatch
-    df["bonded_stock"] = df["bonded_stock_raw"].clip(lower=0)
-    _neg_bonded = (df["bonded_stock_raw"] < 0).sum()
+    # ── Derived: bonded stock (reconciled) ──
+    df["total_stock"] = df["total_stock"].clip(lower=0)
+    df["twc_stock_raw"] = df["twc_stock"].fillna(0).clip(lower=0)
+    _twc_over_total = int((df["twc_stock_raw"] > df["total_stock"]).sum())
+    # Enforce stock identity: Total = TWC + Bonded
+    df["twc_stock"] = np.minimum(df["twc_stock_raw"], df["total_stock"])
+    df["bonded_stock"] = df["total_stock"] - df["twc_stock"]
 
     # ── YoY Sales Comparison ──
     df["yoy_sales_change"] = safe_div(
@@ -635,7 +906,10 @@ if is_admin and st.button("🚀 Generate Weekly Report", type="primary"):
         df["quantity_sold"] - df["expected_ytd_sales"],
         np.nan,
     )
-    df["sales_pace_pct"] = safe_div(df["quantity_sold"], df["expected_ytd_sales"])
+    df["sales_pace_pct"] = safe_div(
+        df["quantity_sold"] - df["expected_ytd_sales"],
+        df["expected_ytd_sales"],
+    )
     df["sales_health"] = df["sales_pace_pct"].apply(health_label)
 
     # ── What's needed to hit the annual target ──
@@ -755,7 +1029,7 @@ if is_admin and st.button("🚀 Generate Weekly Report", type="primary"):
         "reorder_bonded": int((df["bonded_reorder"] == "REORDER").sum()),
         "reorder_twc": int((df["twc_reorder"] == "REORDER").sum()),
         "stockout_high": int((df["stockout_risk"] == "⚠️ HIGH").sum()),
-        "neg_bonded_count": _neg_bonded,
+        "twc_over_total_count": _twc_over_total,
     }
 
     # Save report_week to session state for dashboard display
@@ -821,12 +1095,12 @@ if isinstance(rpt, pd.DataFrame) and not rpt.empty:
     m10.metric("⚠️ Stockout Risk", hs.get("stockout_high", 0))
 
     # ── Data quality note ──
-    _neg = hs.get("neg_bonded_count", 0)
-    if _neg > 0:
+    _twc_over = hs.get("twc_over_total_count", hs.get("neg_bonded_count", 0))
+    if _twc_over > 0:
         st.warning(
-            f"**{_neg} SKUs** have TWC stock exceeding total stock (bonded clamped to 0). "
-            "This is a timing mismatch between the Stock Summary and TWC exports — "
-            "ensure both reports cover the same period."
+            f"**{_twc_over} SKUs** had TWC stock above total stock in the raw files. "
+            "Report values were reconciled so TWC never exceeds Total (Bonded = Total - TWC). "
+            "Please verify the two stock exports are for the same cutoff period."
         )
 
     st.markdown("---")
@@ -834,10 +1108,10 @@ if isinstance(rpt, pd.DataFrame) and not rpt.empty:
     # ── Sales Health Dashboard ──
     st.subheader("📈 Sales Health vs Targets")
     h1, h2, h3, h4 = st.columns(4)
-    h1.metric("🟢 Ahead (≥110%)", hs.get("ahead", 0))
-    h2.metric("🟡 On Track (90-110%)", hs.get("on_track", 0))
-    h3.metric("🟠 Behind (70-90%)", hs.get("behind", 0))
-    h4.metric("🔴 Critical (<70%)", hs.get("critical", 0))
+    h1.metric("🟢 Ahead (≥+10%)", hs.get("ahead", 0))
+    h2.metric("🟡 On Track (-10% to +10%)", hs.get("on_track", 0))
+    h3.metric("🟠 Behind (-30% to -10%)", hs.get("behind", 0))
+    h4.metric("🔴 Critical (<-30%)", hs.get("critical", 0))
 
     # Health distribution chart
     health_order = ["🟢 Ahead", "🟡 On Track", "🟠 Behind", "🔴 Critical"]
@@ -1060,7 +1334,7 @@ if isinstance(rpt, pd.DataFrame) and not rpt.empty:
             },
             title="Each dot = 1 SKU: are you selling fast enough AND have enough stock?",
         )
-        fig_scatter.add_vline(x=1.0, line_dash="dash", line_color="gray", annotation_text="100% Pace")
+        fig_scatter.add_vline(x=0.0, line_dash="dash", line_color="gray", annotation_text="On Target (0%)")
         fig_scatter.add_hline(y=5.0, line_dash="dash", line_color="gray", annotation_text="5-Mo Coverage")
         fig_scatter.update_layout(height=500)
         st.plotly_chart(fig_scatter, use_container_width=True)
