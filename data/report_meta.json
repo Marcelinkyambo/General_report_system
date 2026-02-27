@@ -1,0 +1,23 @@
+{
+  "report_week": 9,
+  "weeks_elapsed": 8,
+  "remaining_weeks": 44,
+  "saved_date": "2026-02-27",
+  "health_stats": {
+    "total_skus": 728,
+    "skus_with_target": 531,
+    "ahead": 159,
+    "on_track": 31,
+    "behind": 30,
+    "critical": 311,
+    "total_cy_sales": 10426,
+    "total_py_sales": 10062,
+    "total_stock": 35679,
+    "total_twc_stock": 18275,
+    "total_bonded": 17404,
+    "reorder_bonded": 138,
+    "reorder_twc": 97,
+    "stockout_high": 26,
+    "twc_over_total_count": 291
+  }
+}

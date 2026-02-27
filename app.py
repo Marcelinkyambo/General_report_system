@@ -77,7 +77,16 @@ def sku_to_group_key(sku):
 def read_uploaded(uploaded_file):
     """Read CSV or Excel and normalize columns."""
     if uploaded_file.name.lower().endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
+        last_err = None
+        for enc in ["utf-8-sig", "utf-8", "cp1252", "latin1"]:
+            try:
+                uploaded_file.seek(0)
+                df = pd.read_csv(uploaded_file, encoding=enc)
+                break
+            except UnicodeDecodeError as e:
+                last_err = e
+        else:
+            raise ValueError(f"Could not decode CSV file {uploaded_file.name}: {last_err}")
     else:
         df = pd.read_excel(uploaded_file)
     return normalize_columns(df)
