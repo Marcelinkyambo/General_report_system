@@ -1,0 +1,28 @@
+# Put this [zoho] block in .streamlit/secrets.toml, or use the app's connection form.
+# Never commit real credentials.
+[zoho]
+organization_id = ""
+client_id = ""
+client_secret = ""
+refresh_token = ""
+region = "com"
+# DP World = Bonded; In Traansit / In Transit = In Transit; all others = Cleared.
+warehouse_mapping_mode = "names"
+include_credit_notes = true
+include_vendor_credits = true
+# Enable only if your sales exports include separate sales receipts.
+include_sales_receipts = false
+request_interval = 0.7
+max_api_calls = 250
+# Check transaction indexes for deletions daily; use change-only reads between checks.
+full_reconcile_hours = 24
+# Repeated report builds reuse complete data and stock for 15 minutes.
+# The app's Refresh now option bypasses these short caches.
+pull_cache_minutes = 15
+stock_cache_minutes = 15
+
+[zoho.locations]
+# Only required if warehouse_mapping_mode = "ids".
+cleared = []
+bonded = []
+in_transit = []

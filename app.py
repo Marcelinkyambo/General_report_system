@@ -12,13 +12,24 @@ from io import BytesIO
 from fpdf import FPDF
 import unicodedata
 import math
+from weekly_pipeline import build_weekly_report
+from planning import prepare_planning, brand_history, brand_key, load_growth, save_growth
+from automation_ui import render_zoho_source, render_brand_editor, render_pull_progress
+from automate_report import elapsed_weeks as elapsed_weeks_at_cutoff, load_year_plan, local_today
+from report_store import attention_css, load_report, publish_report, report_excel_bytes, weekly_report_view, purchase_order_audit_view, REPORT_COLUMNS
+from report_logic import (
+    apply_reorder_flags,
+    apply_stock_coverage,
+    derive_stock_components,
+    find_closing_stock_quantity_column,
+)
 
 # =====================================================
 # CONFIG
 # =====================================================
 st.set_page_config(page_title="Weekly Sales & Stock Report", layout="wide")
 
-CURRENT_YEAR = date.today().year
+CURRENT_YEAR = local_today().year
 WEEKS_IN_YEAR = 52
 MONTHS_IN_YEAR = 12
 
@@ -26,6 +37,7 @@ MONTHS_IN_YEAR = 12
 DATA_DIR = Path(__file__).parent / "data"
 SAVED_REPORT_CSV = DATA_DIR / "report.csv"
 SAVED_REPORT_META = DATA_DIR / "report_meta.json"
+BRAND_GROWTH_FILE = DATA_DIR / "brand_growth.json"
 
 ADMIN_PASSWORD = "twc2026"  # Change this to your preferred password
 
@@ -165,10 +177,7 @@ def sanitize_pdf_safe(v):
     return s.encode("latin-1", errors="replace").decode("latin-1")
 
 def df_to_excel(df):
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        df.to_excel(w, index=False)
-    return buf.getvalue()
+    return report_excel_bytes(df, st.session_state.get("report_po_audit"))
 
 def df_to_pdf(df):
     pdf = FPDF(orientation="L")
@@ -205,24 +214,27 @@ if is_admin:
 # =====================================================
 def load_saved_report():
     """Load previously saved report from data/ folder."""
-    if SAVED_REPORT_CSV.exists() and SAVED_REPORT_META.exists():
-        try:
-            rpt = pd.read_csv(SAVED_REPORT_CSV)
-            with open(SAVED_REPORT_META, "r") as f:
-                meta = json.load(f)
-            return rpt, meta
-        except Exception:
-            return pd.DataFrame(), {}
-    return pd.DataFrame(), {}
+    try:
+        rpt, meta, audit = load_report(DATA_DIR)
+        st.session_state["report_po_audit"] = audit
+        st.session_state["report_source_metadata"] = meta
+        return rpt, meta
+    except (ValueError, OSError):
+        return pd.DataFrame(), {}
 
 # Initialize report from saved data if available
-if "report" not in st.session_state or st.session_state.get("report", pd.DataFrame()).empty:
+_saved_source = DATA_DIR / "current_report.json"
+if not _saved_source.exists():
+    _saved_source = SAVED_REPORT_CSV
+_saved_revision = _saved_source.stat().st_mtime_ns if _saved_source.exists() else 0
+if "report" not in st.session_state or st.session_state.get("loaded_report_revision") != _saved_revision:
     saved_rpt, saved_meta = load_saved_report()
     if not saved_rpt.empty:
         st.session_state["report"] = saved_rpt
         st.session_state["health_stats"] = saved_meta.get("health_stats", {})
         st.session_state["saved_report_week"] = saved_meta.get("report_week", 0)
         st.session_state["saved_weeks_elapsed"] = saved_meta.get("weeks_elapsed", 0)
+    st.session_state["loaded_report_revision"] = _saved_revision
 
 # =====================================================
 # ADMIN: SESSION STATE
@@ -235,6 +247,8 @@ _state_keys = {
     "purchases_cy": pd.DataFrame(),
     "purchases_py": pd.DataFrame(),
     "twc_stock": pd.DataFrame(),
+    "bonded_stock_file": pd.DataFrame(),
+    "in_transit": pd.DataFrame(),
     "item_details": pd.DataFrame(),
     "planning": pd.DataFrame(),
 }
@@ -245,12 +259,27 @@ if "report" not in st.session_state:
     st.session_state["report"] = pd.DataFrame()
 # Default upload vars (only populated in admin mode)
 sales_cy_file = sales_py_file = stock_cy_file = stock_py_file = None
-purch_cy_file = purch_py_file = twc_file = item_details_file = planning_file = None
+purch_cy_file = purch_py_file = twc_file = bonded_stock_file = in_transit_file = item_details_file = planning_file = None
 
 # =====================================================
 # ADMIN: SIDEBAR — FILE UPLOADS
 # =====================================================
+source_mode = "File uploads"
 if is_admin:
+    source_mode = st.sidebar.radio("Report data source", ["File uploads", "Zoho Books"],
+                                   disabled=bool(st.session_state.get("zoho_job_id")))
+    if st.session_state.get("input_source_mode", source_mode) != source_mode:
+        for key in _state_keys:
+            st.session_state[key] = pd.DataFrame()
+        for key in ["source_metadata", "purchase_orders", "po_audit"]:
+            st.session_state.pop(key, None)
+    st.session_state["input_source_mode"] = source_mode
+    if source_mode == "Zoho Books":
+        render_zoho_source(st)
+    with st.sidebar:
+        render_pull_progress()
+
+if is_admin and source_mode == "File uploads":
     st.title("📊 Weekly Sales & Stock Planning Report — Admin")
 
     st.sidebar.header("📁 Upload Weekly Data Files")
@@ -278,6 +307,24 @@ if is_admin:
     st.sidebar.subheader("TWC Stock")
     twc_file = st.sidebar.file_uploader("TWC Stock Summary", type=["csv", "xlsx"], key="up_twc")
 
+    # --- Bonded Stock ---
+    st.sidebar.subheader("Bonded Stock")
+    bonded_stock_file = st.sidebar.file_uploader(
+        "Bonded Stock Summary",
+        type=["csv", "xlsx"],
+        key="up_bonded_stock",
+        help="Stock summary for bonded warehouse. Closing stock used as Bonded Stock quantity.",
+    )
+
+    # --- In Transit ---
+    st.sidebar.subheader("In Transit")
+    in_transit_file = st.sidebar.file_uploader(
+        "In-Transit Stock Report",
+        type=["csv", "xlsx"],
+        key="up_in_transit",
+        help="Stock summary for in-transit items. Closing stock used as In Transit quantity.",
+    )
+
     # --- Item Details (metadata) ---
     st.sidebar.subheader("Item Details (Optional)")
     item_details_file = st.sidebar.file_uploader(
@@ -289,7 +336,7 @@ if is_admin:
 
     # --- Planning ---
     st.sidebar.subheader("Sales Planning / Targets")
-    planning_file = st.sidebar.file_uploader("Stock Planning 2026 (XLSX)", type=["csv", "xlsx"], key="up_plan")
+    planning_file = st.sidebar.file_uploader("Annual stock planning benchmark", type=["csv", "xlsx"], key="up_plan")
 else:
     st.title("📊 Weekly Sales & Stock Planning Report")
 
@@ -352,11 +399,7 @@ def _process_stock(uploaded, state_key):
     raw = read_uploaded(uploaded)
     sku_col = find_col(raw, ["sku"])
     open_col = find_col(raw, ["opening_stock"], ["amount"]) or find_col(raw, ["opening"], ["amount"])
-    close_col = (
-        find_col(raw, ["closing_stock"], ["amount"])
-        or find_col(raw, ["closing_balance"], ["amount"])
-        or find_col(raw, ["closing"], ["amount"])
-    )
+    close_col = find_closing_stock_quantity_column(raw.columns)
     qty_in_col = find_col(raw, ["quantity_in"], ["amount"]) or find_col(raw, ["qty_in"])
     qty_out_col = find_col(raw, ["quantity_out"], ["amount"]) or find_col(raw, ["qty_out"])
     cat_col = find_col(raw, ["category_name"])
@@ -460,12 +503,7 @@ def _process_twc(uploaded):
         return
     raw = read_uploaded(uploaded)
     sku_col = find_col(raw, ["sku"])
-    close_col = (
-        find_col(raw, ["closing_stock"], ["amount"])
-        or find_col(raw, ["closing_balance"], ["amount"])
-        or find_col(raw, ["closing"], ["amount"])
-        or find_col(raw, ["stock"], ["amount", "opening"])
-    )
+    close_col = find_closing_stock_quantity_column(raw.columns)
     item_col = find_col(raw, ["item", "name"]) or find_col(raw, ["item_name"])
     cat_col = find_col(raw, ["category_name"])
     origin_col = find_col(raw, ["country"]) or find_col(raw, ["origin"])
@@ -502,6 +540,79 @@ def _process_twc(uploaded):
         "_brand": "brand",
     }, inplace=True)
     st.session_state["twc_stock"] = grouped
+
+
+def _process_bonded_stock(uploaded):
+    """Read Bonded Stock Summary → closing stock by SKU prefix."""
+    if uploaded is None:
+        return
+    raw = read_uploaded(uploaded)
+    sku_col = find_col(raw, ["sku"])
+    close_col = find_closing_stock_quantity_column(raw.columns)
+    item_col = find_col(raw, ["item", "name"]) or find_col(raw, ["item_name"])
+    cat_col = find_col(raw, ["category_name"])
+
+    if not sku_col or not close_col:
+        st.sidebar.error(f"Cannot detect SKU or Closing Stock column in {uploaded.name}")
+        return
+
+    raw["_sku"] = raw[sku_col].apply(normalize_sku)
+    raw["_sku_grp"] = raw["_sku"].apply(sku_to_group_key)
+    raw = raw[raw["_sku_grp"].str.replace("0", "") != ""].copy()
+    raw[close_col] = pd.to_numeric(raw[close_col].replace("--", 0), errors="coerce").fillna(0)
+
+    agg = {close_col: "sum", "_sku": first_non_empty}
+    if item_col:
+        raw["_item"] = raw[item_col]
+        agg["_item"] = first_non_empty
+    if cat_col:
+        raw["_cat"] = raw[cat_col]
+        agg["_cat"] = first_non_empty
+
+    grouped = raw.groupby("_sku_grp", as_index=False).agg(agg)
+    grouped.rename(columns={
+        "_sku_grp": "sku_key", close_col: "bonded_stock_uploaded", "_sku": "sku",
+        "_item": "item_name", "_cat": "category",
+    }, inplace=True)
+    st.session_state["bonded_stock_file"] = grouped
+
+
+def _process_in_transit(uploaded):
+    """Read In-Transit Stock report → in-transit quantity by SKU prefix."""
+    if uploaded is None:
+        return
+    raw = read_uploaded(uploaded)
+    sku_col = find_col(raw, ["sku"])
+    qty_col = find_closing_stock_quantity_column(raw.columns)
+    item_col = find_col(raw, ["item", "name"]) or find_col(raw, ["item_name"])
+    cat_col = find_col(raw, ["category_name"])
+
+    if not sku_col or not qty_col:
+        st.sidebar.error(f"Cannot detect SKU or Closing Stock column in {uploaded.name}")
+        return
+
+    raw["_sku"] = raw[sku_col].apply(normalize_sku)
+    raw["_sku_grp"] = raw["_sku"].apply(sku_to_group_key)
+    raw = raw[raw["_sku_grp"].str.replace("0", "") != ""].copy()
+    raw["_qty_in"] = pd.to_numeric(raw[qty_col], errors="coerce").fillna(0)
+
+    agg = {"_sku": first_non_empty, "_qty_in": "sum"}
+    if item_col:
+        raw["_item"] = raw[item_col]
+        agg["_item"] = first_non_empty
+    if cat_col:
+        raw["_cat"] = raw[cat_col]
+        agg["_cat"] = first_non_empty
+
+    grouped = raw.groupby("_sku_grp", as_index=False).agg(agg)
+    grouped.rename(columns={
+        "_sku_grp": "sku_key", "_sku": "sku",
+        "_qty_in": "in_transit_qty",
+        "_item": "item_name", "_cat": "category",
+    }, inplace=True)
+    # Only keep rows with actual in-transit quantities
+    grouped = grouped[grouped["in_transit_qty"] > 0].copy()
+    st.session_state["in_transit"] = grouped
 
 
 def _process_item_details(uploaded):
@@ -570,40 +681,13 @@ def _process_item_details(uploaded):
 
 
 def _process_planning(uploaded):
-    """Read Stock Planning file → monthly targets by SKU prefix."""
-    if uploaded is None:
-        return
-    raw = read_uploaded(uploaded)
-    sku_col = find_col(raw, ["sku"])
-    target_col = (
-        find_col(raw, ["monthly", "sales", "target"])
-        or find_col(raw, ["monthly_sales_target"])
-        or find_col(raw, ["monthly", "target"])
-    )
-    budget_col = find_col(raw, ["next_year_budget"]) or find_col(raw, ["next", "year", "budget"])
-    prev_sales_col = find_col(raw, ["previous_year_sales"]) or find_col(raw, ["previous", "year", "sales"])
-    plan_growth_col = find_col(raw, ["growth_target"]) or find_col(raw, ["growth"])
-
-    if not sku_col or not target_col:
-        st.sidebar.error(
-            f"Cannot detect SKU or Monthly Sales Target column. "
-            f"Available: {list(raw.columns)}"
-        )
-        return
-
-    raw["sku"] = raw[sku_col].apply(normalize_sku)
-    result = pd.DataFrame({"sku": raw["sku"]})
-    result["monthly_target_plan"] = pd.to_numeric(raw[target_col], errors="coerce").fillna(0)
-    if budget_col:
-        result["annual_budget_plan"] = pd.to_numeric(raw[budget_col], errors="coerce").fillna(0)
-    else:
-        result["annual_budget_plan"] = result["monthly_target_plan"] * 12
-    if prev_sales_col:
-        result["prev_year_sales_plan"] = pd.to_numeric(raw[prev_sales_col], errors="coerce").fillna(0)
-    if plan_growth_col:
-        result["growth_target_plan"] = pd.to_numeric(raw[plan_growth_col], errors="coerce").fillna(0)
-
-    st.session_state["planning"] = result
+    if uploaded is not None:
+        try:
+            st.session_state["planning"] = prepare_planning(read_uploaded(uploaded))
+            st.session_state.pop("planning_error", None)
+        except ValueError as exc:
+            st.session_state["planning_error"] = str(exc)
+            st.sidebar.error(str(exc))
 
 
 # Run all processors (upload vars are None when not in admin mode — processors handle gracefully)
@@ -614,6 +698,8 @@ _process_stock(stock_py_file, "stock_py")
 _process_purchases(purch_cy_file, "purchases_cy")
 _process_purchases(purch_py_file, "purchases_py")
 _process_twc(twc_file)
+_process_bonded_stock(bonded_stock_file)
+_process_in_transit(in_transit_file)
 _process_item_details(item_details_file)
 _process_planning(planning_file)
 
@@ -625,22 +711,36 @@ if is_admin:
 
     st.header("⚙️ Report Parameters")
 
+    source_meta = st.session_state.get("source_metadata", {})
+    sales_cutoff = date.fromisoformat(source_meta["sales_as_of"]) if source_meta.get("sales_as_of") else None
+    report_year = st.number_input("Report year", min_value=2000, max_value=2100,
+                                  value=sales_cutoff.year if sales_cutoff else CURRENT_YEAR,
+                                  disabled=bool(sales_cutoff))
+    if planning_file is None and (st.session_state.planning.empty or st.session_state.get("planning_year_loaded") != report_year):
+        try:
+            st.session_state["planning"] = load_year_plan(report_year)
+            st.session_state["planning_year_loaded"] = report_year
+        except ValueError as exc:
+            st.error(str(exc))
+
     p1, p2, p3 = st.columns(3)
     with p1:
         report_week = st.number_input(
-            "Report Week #", min_value=1, max_value=52,
-            value=week_number_now(),
+            "Report Week #", min_value=1, max_value=53,
+            value=sales_cutoff.isocalendar().week if sales_cutoff else week_number_now(),
+            disabled=bool(sales_cutoff),
             help="ISO week number of this report",
         )
     with p2:
         weeks_elapsed = st.number_input(
-            "Weeks Elapsed (YTD period)", min_value=1, max_value=52,
-            value=weeks_elapsed_in_year(),
+            "Weeks Elapsed (YTD period)", min_value=0.01, max_value=52.0,
+            value=elapsed_weeks_at_cutoff(sales_cutoff) if sales_cutoff else float(weeks_elapsed_in_year()),
+            disabled=bool(sales_cutoff), format="%.3f",
             help="Number of completed weeks in the YTD data",
         )
     with p3:
         growth_pct = st.number_input(
-            "Growth Target (%)", min_value=0.0, max_value=200.0,
+            "Default Growth Target (%)", min_value=-100.0, max_value=1000.0,
             value=20.0,
         ) / 100
 
@@ -652,422 +752,62 @@ if is_admin:
         f"📅 Week {report_week} | {weeks_elapsed} weeks elapsed ≈ {months_elapsed:.1f} months | "
         f"{remaining_weeks} weeks / {remaining_months:.1f} months remaining"
     )
+    if source_meta:
+        st.caption(f"Sales through {source_meta['sales_as_of']}. Live stock and open POs dated {source_meta['stock_as_of']}.")
+    render_brand_editor(st, report_year, st.session_state)
 
 
 # =====================================================
 # GENERATE REPORT (Admin only)
 # =====================================================
-if is_admin and st.button("🚀 Generate Weekly Report", type="primary"):
-
-    # ── Validate minimum inputs ──
-    if st.session_state.sales_cy.empty:
-        st.error("Please upload the Current Year Sales file.")
+_generate_clicked = is_admin and st.button("🚀 Generate Weekly Report", type="primary",
+                                          disabled=bool(st.session_state.get("zoho_job_id")))
+_generate_from_zoho = is_admin and st.session_state.pop("zoho_generate_pending", False)
+if is_admin and (_generate_clicked or _generate_from_zoho):
+    try:
+        if planning_file is not None and st.session_state.get("planning_error"):
+            raise ValueError(st.session_state["planning_error"])
+        report, health_stats = build_weekly_report(
+            {key: st.session_state[key] for key in _state_keys} | {
+                "purchase_orders": st.session_state.get("purchase_orders", pd.DataFrame())
+            },
+            weeks_elapsed=weeks_elapsed, growth_pct=growth_pct,
+            brand_rates=load_growth(BRAND_GROWTH_FILE, report_year),
+        )
+    except ValueError as exc:
+        st.error(str(exc))
         st.stop()
-    if st.session_state.stock_cy.empty:
-        st.error("Please upload the Current Year Stock Summary file.")
-        st.stop()
-
-    # ── Start from current-year sales ──
-    df = st.session_state.sales_cy.copy()
-
-    # ── Merge previous-year sales ──
-    if not st.session_state.sales_py.empty:
-        py = st.session_state.sales_py[["sku_key", "quantity_sold"]].rename(
-            columns={"quantity_sold": "py_sales"}
-        )
-        df = df.merge(py, on="sku_key", how="left")
-    else:
-        df["py_sales"] = 0
-    df["py_sales"] = df["py_sales"].fillna(0)
-
-    # ── Merge current-year stock (outer join to include items with stock but no sales) ──
-    stk = st.session_state.stock_cy.copy()
-    stk.rename(columns={
-        "opening_stock": "opening_stock_cy",
-        "closing_stock": "total_stock",
-        "qty_in": "qty_in_cy",
-        "qty_out": "qty_out_cy",
-    }, inplace=True)
-    stk_merge_cols = ["sku_key", "opening_stock_cy", "total_stock", "qty_in_cy", "qty_out_cy"]
-    for extra in ["sku", "item_name", "category"]:
-        if extra in stk.columns:
-            stk_merge_cols.append(extra)
-    stk = stk[stk_merge_cols].copy()
-    df = df.merge(stk, on="sku_key", how="outer", suffixes=("", "_stk"))
-
-    # Fill metadata from stock for stock-only items (no sales)
-    for col in ["sku", "item_name", "category"]:
-        stk_col = f"{col}_stk"
-        if stk_col in df.columns:
-            if col in df.columns:
-                df[col] = df[col].fillna(df[stk_col])
-            else:
-                df[col] = df[stk_col]
-            df.drop(columns=[stk_col], inplace=True)
-    df["quantity_sold"] = df["quantity_sold"].fillna(0)
-    df["revenue"] = df["revenue"].fillna(0)
-
-    # ── Merge previous-year stock ──
-    if not st.session_state.stock_py.empty:
-        stk_py = st.session_state.stock_py[["sku_key", "closing_stock"]].rename(
-            columns={"closing_stock": "total_stock_py"}
-        )
-        df = df.merge(stk_py, on="sku_key", how="left")
-    else:
-        df["total_stock_py"] = np.nan
-
-    # ── Merge purchases ──
-    if not st.session_state.purchases_cy.empty:
-        pur_cy = st.session_state.purchases_cy[["sku_key", "quantity_purchased"]].rename(
-            columns={"quantity_purchased": "purchases_cy"}
-        )
-        df = df.merge(pur_cy, on="sku_key", how="left")
-    else:
-        df["purchases_cy"] = 0
-
-    if not st.session_state.purchases_py.empty:
-        pur_py = st.session_state.purchases_py[["sku_key", "quantity_purchased"]].rename(
-            columns={"quantity_purchased": "purchases_py"}
-        )
-        df = df.merge(pur_py, on="sku_key", how="left")
-    else:
-        df["purchases_py"] = 0
-
-    # ── Merge TWC stock ──
-    if not st.session_state.twc_stock.empty:
-        twc = st.session_state.twc_stock[["sku_key", "twc_stock"]].copy()
-        df = df.merge(twc, on="sku_key", how="left")
-    else:
-        df["twc_stock"] = np.nan
-
-    # ── Merge planning targets ──
-    has_planning = not st.session_state.planning.empty
-    if has_planning:
-        plan = st.session_state.planning.copy()
-        plan["sku_key"] = plan["sku"].apply(sku_to_group_key)
-        plan_cols = [c for c in plan.columns if c != "sku"]
-        df = df.merge(plan[plan_cols], on="sku_key", how="left")
-
-    # ── Metadata backfill from all uploaded sources ──
-    metadata_cols = ["sku", "item_name", "category", "country_of_origin", "brand"]
-    metadata_sources = []
-    for state_key in ["sales_cy", "sales_py", "stock_cy", "stock_py", "purchases_cy", "purchases_py", "twc_stock", "item_details"]:
-        src = st.session_state.get(state_key, pd.DataFrame())
-        if not isinstance(src, pd.DataFrame) or src.empty or "sku_key" not in src.columns:
-            continue
-        cols = ["sku_key"] + [c for c in metadata_cols if c in src.columns]
-        if len(cols) > 1:
-            metadata_sources.append(src[cols].copy())
-
-    if metadata_sources:
-        meta_all = pd.concat(metadata_sources, ignore_index=True, sort=False)
-        meta_agg_spec = {}
-        for col in metadata_cols:
-            if col in meta_all.columns:
-                meta_agg_spec[col] = first_non_empty
-        meta = meta_all.groupby("sku_key", as_index=False).agg(meta_agg_spec)
-        df = df.merge(meta, on="sku_key", how="left", suffixes=("", "_meta"))
-
-        for col in metadata_cols:
-            meta_col = f"{col}_meta"
-            if meta_col not in df.columns:
-                continue
-            if col in df.columns:
-                current = df[col]
-                current_text = current.astype(str).str.strip().str.lower()
-                missing_mask = current.isna() | current_text.isin(["", "nan", "none", "null", "--"])
-                df[col] = np.where(missing_mask, df[meta_col], current)
-            else:
-                df[col] = df[meta_col]
-            df.drop(columns=[meta_col], inplace=True)
-
-    # ── Metadata enrichment for non-sales items ──
-    for col in ["brand", "country_of_origin"]:
-        if col not in df.columns:
-            df[col] = np.nan
-
-    if "item_name" in df.columns:
-        df["_item_name_key"] = df["item_name"].apply(item_name_key)
-        has_key = df["_item_name_key"].astype(str).str.len() > 0
-        has_brand = df["brand"].notna() & ~df["brand"].astype(str).str.strip().str.lower().isin(["", "nan", "none", "null", "--"])
-        has_country = df["country_of_origin"].notna() & ~df["country_of_origin"].astype(str).str.strip().str.lower().isin(["", "nan", "none", "null", "--"])
-
-        by_name_sources = []
-        base_name_cols = ["_item_name_key"]
-        if has_brand.any():
-            base_name_cols.append("brand")
-        if has_country.any():
-            base_name_cols.append("country_of_origin")
-        if len(base_name_cols) > 1:
-            by_name_sources.append(df.loc[has_key, base_name_cols].copy())
-
-        details = st.session_state.get("item_details", pd.DataFrame())
-        if isinstance(details, pd.DataFrame) and not details.empty:
-            details_name = details.copy()
-            if "item_name_key" not in details_name.columns and "item_name" in details_name.columns:
-                details_name["item_name_key"] = details_name["item_name"].apply(item_name_key)
-            if "item_name_key" in details_name.columns:
-                dcols = ["item_name_key"]
-                if "brand" in details_name.columns:
-                    dcols.append("brand")
-                if "country_of_origin" in details_name.columns:
-                    dcols.append("country_of_origin")
-                if len(dcols) > 1:
-                    dn = details_name[dcols].copy().rename(columns={"item_name_key": "_item_name_key"})
-                    dn = dn[dn["_item_name_key"].astype(str).str.len() > 0]
-                    by_name_sources.append(dn)
-
-        if by_name_sources:
-            by_name_all = pd.concat(by_name_sources, ignore_index=True, sort=False)
-            by_name_spec = {}
-            if "brand" in by_name_all.columns:
-                by_name_spec["brand"] = first_non_empty
-            if "country_of_origin" in by_name_all.columns:
-                by_name_spec["country_of_origin"] = first_non_empty
-            by_name = (
-                by_name_all
-                .groupby("_item_name_key", as_index=False)
-                .agg(by_name_spec)
-                .rename(columns={"brand": "_brand_by_name", "country_of_origin": "_country_by_name"})
-            )
-            df = df.merge(by_name, on="_item_name_key", how="left")
-            if "_brand_by_name" in df.columns:
-                brand_missing = ~has_brand
-                df["brand"] = np.where(brand_missing, df["_brand_by_name"], df["brand"])
-                df.drop(columns=["_brand_by_name"], inplace=True)
-            if "_country_by_name" in df.columns:
-                country_missing = ~has_country
-                df["country_of_origin"] = np.where(country_missing, df["_country_by_name"], df["country_of_origin"])
-                df.drop(columns=["_country_by_name"], inplace=True)
-
-        df.drop(columns=["_item_name_key"], inplace=True)
-
-    # Fill country from known brand-country pairs where possible
-    brand_vals = df["brand"].astype(str).str.strip()
-    country_vals = df["country_of_origin"].astype(str).str.strip()
-    valid_brand = df["brand"].notna() & ~brand_vals.str.lower().isin(["", "nan", "none", "null", "--"])
-    valid_country = df["country_of_origin"].notna() & ~country_vals.str.lower().isin(["", "nan", "none", "null", "--"])
-    brand_country = (
-        df[valid_brand & valid_country]
-        .groupby("brand", as_index=False)
-        .agg({"country_of_origin": first_non_empty})
-        .rename(columns={"country_of_origin": "_country_by_brand"})
-    )
-    if not brand_country.empty:
-        df = df.merge(brand_country, on="brand", how="left")
-        country_missing = ~valid_country
-        df["country_of_origin"] = np.where(country_missing, df["_country_by_brand"], df["country_of_origin"])
-        df.drop(columns=["_country_by_brand"], inplace=True)
-
-    # Ensure report columns always exist (explicit fallback if unknown)
-    for col in ["brand", "country_of_origin"]:
-        vals = df[col].astype(str).str.strip()
-        missing = df[col].isna() | vals.str.lower().isin(["", "nan", "none", "null", "--"])
-        df[col] = np.where(missing, "Unknown", df[col])
-
-    # ── Fill NaN numerics ──
-    num_fills = {
-        "total_stock": 0, "total_stock_py": 0, "twc_stock": 0,
-        "opening_stock_cy": 0, "qty_in_cy": 0, "qty_out_cy": 0,
-        "purchases_cy": 0, "purchases_py": 0, "revenue": 0,
-        "py_sales": 0, "quantity_sold": 0,
-    }
-    for col, fill in num_fills.items():
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(fill)
-
-    # ── Derived: bonded stock (reconciled) ──
-    df["total_stock"] = df["total_stock"].clip(lower=0)
-    df["twc_stock_raw"] = df["twc_stock"].fillna(0).clip(lower=0)
-    _twc_over_total = int((df["twc_stock_raw"] > df["total_stock"]).sum())
-    # Enforce stock identity: Total = TWC + Bonded
-    df["twc_stock"] = np.minimum(df["twc_stock_raw"], df["total_stock"])
-    df["bonded_stock"] = df["total_stock"] - df["twc_stock"]
-
-    # ── YoY Sales Comparison ──
-    df["yoy_sales_change"] = safe_div(
-        df["quantity_sold"] - df["py_sales"], df["py_sales"]
-    )
-
-    # ── Weekly run rate ──
-    df["weekly_run_rate"] = safe_div(df["quantity_sold"], weeks_elapsed)
-    df["py_weekly_run_rate"] = safe_div(df["py_sales"], weeks_elapsed)
-    remaining_weeks_safe = max(remaining_weeks, 0)
-    df["remaining_year_demand"] = df["weekly_run_rate"] * remaining_weeks_safe
-
-    # ── Monthly Sales Target (from planning or fallback) ──
-    if has_planning and "monthly_target_plan" in df.columns:
-        fallback = df["quantity_sold"] * (1 + growth_pct) / 12
-        df["monthly_sales_target"] = df["monthly_target_plan"].where(
-            df["monthly_target_plan"].notna() & (df["monthly_target_plan"] > 0),
-            fallback,
-        )
-    else:
-        df["monthly_sales_target"] = df["quantity_sold"] * (1 + growth_pct) / 12
-
-    df["weekly_sales_target"] = df["monthly_sales_target"] * 12 / WEEKS_IN_YEAR
-    df["annual_target"] = df["monthly_sales_target"] * 12
-
-    # ── Sales Health vs Target ──
-    df["expected_ytd_sales"] = df["weekly_sales_target"] * weeks_elapsed
-    df["ytd_variance"] = np.where(
-        df["expected_ytd_sales"] > 0,
-        df["quantity_sold"] - df["expected_ytd_sales"],
-        np.nan,
-    )
-    df["sales_pace_pct"] = safe_div(
-        df["quantity_sold"] - df["expected_ytd_sales"],
-        df["expected_ytd_sales"],
-    )
-    df["sales_health"] = df["sales_pace_pct"].apply(health_label)
-
-    # ── What's needed to hit the annual target ──
-    df["remaining_target"] = np.where(
-        df["annual_target"] > 0,
-        np.maximum(df["annual_target"] - df["quantity_sold"], 0),
-        np.nan,
-    )
-    if remaining_weeks > 0:
-        df["required_weekly_sales"] = safe_div(df["remaining_target"], remaining_weeks)
-        df["required_monthly_sales"] = df["required_weekly_sales"] * 52 / 12
-    else:
-        df["required_weekly_sales"] = np.nan
-        df["required_monthly_sales"] = np.nan
-
-    df["effort_multiplier"] = safe_div(df["required_weekly_sales"], df["weekly_sales_target"])
-
-    # ── Stock Coverage (based on current sales run rate) ──
-    df["monthly_run_rate"] = safe_div(df["quantity_sold"], months_elapsed)
-    df["total_stock_coverage_months"] = safe_div(df["total_stock"], df["monthly_run_rate"])
-    df["total_stock_coverage_weeks"] = safe_div(df["total_stock"], df["weekly_run_rate"])
-    df["twc_coverage_months"] = safe_div(df["twc_stock"], df["monthly_run_rate"])
-    df["twc_coverage_weeks"] = safe_div(df["twc_stock"], df["weekly_run_rate"])
-
-    # ── Stock Movement (current year) ──
-    df["stock_turnover"] = safe_div(df["qty_out_cy"], df["opening_stock_cy"])
-
-    # ── Reorder flags (based on current-sales coverage) ──
-    # Total stock: reorder when coverage is 5 months or less
-    # TWC stock: reorder when coverage is 1 month or less
-    df["bonded_reorder"] = np.where(
-        df["total_stock_coverage_months"].notna() & (df["total_stock_coverage_months"] <= 5),
-        "REORDER", "",
-    )
-    df["twc_reorder"] = np.where(
-        df["twc_coverage_months"].notna() & (df["twc_coverage_months"] <= 1),
-        "REORDER", "",
-    )
-    bonded_gap = np.maximum(df["remaining_year_demand"] - df["total_stock"], 0)
-    twc_gap = np.maximum(df["remaining_year_demand"] - df["twc_stock"], 0)
-    df["bonded_est_reorder_qty"] = np.where(df["bonded_reorder"] == "REORDER", np.ceil(bonded_gap), 0)
-    df["twc_est_reorder_qty"] = np.where(df["twc_reorder"] == "REORDER", np.ceil(twc_gap), 0)
-
-    # ── Projected stock-out week ──
-    df["weeks_until_stockout"] = np.where(
-        df["weekly_run_rate"] > 0,
-        df["total_stock"] / df["weekly_run_rate"],
-        np.nan,
-    )
-    df["stockout_risk"] = np.where(
-        df["weeks_until_stockout"] < 4, "⚠️ HIGH",
-        np.where(df["weeks_until_stockout"] < 8, "⚡ MEDIUM", ""),
-    )
-
-    # ── Build final report ──
-    report = pd.DataFrame({
-        "SKU": df["sku"],
-        "Item Name": df.get("item_name", ""),
-        "Category": df.get("category", ""),
-        "Country": df.get("country_of_origin", ""),
-        "Brand": df.get("brand", ""),
-        # Sales
-        "CY Sales (YTD)": df["quantity_sold"],
-        "PY Sales (YTD)": df["py_sales"],
-        "YoY Sales %": df["yoy_sales_change"],
-        "CY Revenue (YTD)": df["revenue"],
-        "Weekly Run Rate": df["weekly_run_rate"],
-        # Targets
-        "Monthly Target": df["monthly_sales_target"],
-        "Weekly Target": df["weekly_sales_target"],
-        "Annual Target": df["annual_target"],
-        "Expected YTD": df["expected_ytd_sales"],
-        "YTD Variance": df["ytd_variance"],
-        "Sales Pace %": df["sales_pace_pct"],
-        "Sales Health": df["sales_health"],
-        "Remaining Target": df["remaining_target"],
-        "Req. Weekly Sales": df["required_weekly_sales"],
-        "Req. Monthly Sales": df["required_monthly_sales"],
-        "Effort Multiplier": df["effort_multiplier"],
-        # Stock
-        "Total Stock": df["total_stock"],
-        "TWC Stock": df["twc_stock"],
-        "Bonded Stock": df["bonded_stock"],
-        "Stock Coverage (Mo)": df["total_stock_coverage_months"],
-        "Stock Coverage (Wk)": df["total_stock_coverage_weeks"],
-        "TWC Coverage (Mo)": df["twc_coverage_months"],
-        "TWC Coverage (Wk)": df["twc_coverage_weeks"],
-        "Wks Until Stockout": df["weeks_until_stockout"],
-        "Stockout Risk": df["stockout_risk"],
-        "Bonded Reorder": df["bonded_reorder"],
-        "TWC Reorder": df["twc_reorder"],
-        "Bonded Est. Reorder Qty": df["bonded_est_reorder_qty"],
-        "TWC Est. Reorder Qty": df["twc_est_reorder_qty"],
-        # Purchases
-        "CY Purchases": df["purchases_cy"],
-        "PY Purchases": df["purchases_py"],
-        # Movement
-        "Stock Turnover": df["stock_turnover"],
-    })
-
-    st.session_state.report = report
-
-    # ── Health summary for KPIs ──
-    has_t = df["monthly_sales_target"] > 0
-    st.session_state["health_stats"] = {
-        "total_skus": len(df),
-        "skus_with_target": int(has_t.sum()),
-        "ahead": int((df["sales_health"] == "🟢 Ahead").sum()),
-        "on_track": int((df["sales_health"] == "🟡 On Track").sum()),
-        "behind": int((df["sales_health"] == "🟠 Behind").sum()),
-        "critical": int((df["sales_health"] == "🔴 Critical").sum()),
-        "total_cy_sales": int(df["quantity_sold"].sum()),
-        "total_py_sales": int(df["py_sales"].sum()),
-        "total_stock": int(df["total_stock"].sum()),
-        "total_twc_stock": int(df["twc_stock"].sum()),
-        "total_bonded": int(df["bonded_stock"].sum()),
-        "reorder_bonded": int((df["bonded_reorder"] == "REORDER").sum()),
-        "reorder_twc": int((df["twc_reorder"] == "REORDER").sum()),
-        "stockout_high": int((df["stockout_risk"] == "⚠️ HIGH").sum()),
-        "twc_over_total_count": _twc_over_total,
-    }
-
-    # Save report_week to session state for dashboard display
+    st.session_state["report"] = report
+    st.session_state["health_stats"] = health_stats
     st.session_state["saved_report_week"] = report_week
     st.session_state["saved_weeks_elapsed"] = weeks_elapsed
+    st.session_state["report_source_metadata"] = {
+        **st.session_state.get("source_metadata", {}), "report_year": int(report_year)
+    }
+    st.session_state["report_po_audit"] = st.session_state.get("po_audit", pd.DataFrame()).copy()
+    if source_mode == "Zoho Books":
+        st.session_state["report"]["Stock Turnover"] = np.nan
+    if _generate_from_zoho:
+        st.success("Weekly report ready. Zoho will be checked again when you click Pull from Zoho Books.")
 
 # ── Save for Sharing button (Admin only) ──
 if is_admin and not st.session_state.get("report", pd.DataFrame()).empty:
     st.markdown("---")
-    if st.button("💾 Save Report for Sharing", help="Saves report to data/ folder. Then git push to update the shared dashboard."):
+    if st.button("💾 Save Report for Sharing", help="Publishes the completed report to the dashboard on this installation."):
         DATA_DIR.mkdir(exist_ok=True)
         rpt_to_save = st.session_state["report"]
-        rpt_to_save.to_csv(SAVED_REPORT_CSV, index=False)
         # Convert numpy types to native Python for JSON serialization
         hs_raw = st.session_state.get("health_stats", {})
         hs_clean = {k: int(v) if isinstance(v, (np.integer,)) else float(v) if isinstance(v, (np.floating,)) else v for k, v in hs_raw.items()}
         meta = {
+            **st.session_state.get("report_source_metadata", {}),
             "report_week": int(st.session_state.get("saved_report_week", week_number_now())),
-            "weeks_elapsed": int(st.session_state.get("saved_weeks_elapsed", weeks_elapsed_in_year())),
+            "weeks_elapsed": float(st.session_state.get("saved_weeks_elapsed", weeks_elapsed_in_year())),
             "health_stats": hs_clean,
-            "saved_date": str(date.today()),
+            "saved_date": str(local_today()),
         }
-        with open(SAVED_REPORT_META, "w") as f:
-            json.dump(meta, f, indent=2)
-        st.success(
-            f"✅ Report saved to `data/` folder!\n\n"
-            f"Now run in terminal:\n```\ngit add data/\ngit commit -m \"Update weekly report\"\ngit push\n```\n"
-            f"Streamlit Cloud will auto-redeploy with the new data."
-        )
+        publish_report(DATA_DIR, rpt_to_save, meta, st.session_state.get("report_po_audit"), include_excel=True)
+        st.success("Report saved. The dashboard on this installation will load the completed snapshot.")
 
 
 # =====================================================
@@ -1082,6 +822,15 @@ if isinstance(rpt, pd.DataFrame) and not rpt.empty:
 
     # ── Top-level KPIs ──
     st.header(f"📋 Weekly Report — Week {report_week_display}")
+    _report_meta = st.session_state.get("report_source_metadata", {})
+    if _report_meta.get("sales_as_of"):
+        st.caption(f"Zoho Books sales through {_report_meta['sales_as_of']}. Stock dated {_report_meta['stock_as_of']}; open POs dated {_report_meta.get('po_as_of', _report_meta['stock_as_of'])}.")
+        if _report_meta.get("stock_snapshot_at"):
+            st.caption(f"Stock snapshot: {_report_meta['stock_snapshot_at']}. Books requests for this pull: {_report_meta.get('api_calls', 0):,}.")
+    if _report_meta.get("excluded_non_sku_items"):
+        with st.expander("Non-inventory items excluded from this SKU report"):
+            st.write("Non-inventory items without SKUs, including loyalty points and service charges, are listed here and excluded from product sales and stock planning.")
+            st.dataframe(pd.DataFrame(_report_meta["excluded_non_sku_items"]), hide_index=True)
     st.markdown("---")
 
     st.subheader("🔑 Key Performance Indicators")
@@ -1242,7 +991,7 @@ if isinstance(rpt, pd.DataFrame) and not rpt.empty:
             )
 
     with st.expander("🏪 TWC Reorders (< 1 month coverage)", expanded=False):
-        twc_ro = rpt[rpt["TWC Reorder"] == "REORDER"].sort_values("TWC Coverage (Mo)")
+        twc_ro = rpt[rpt["TWC Reorder"] == "CLEAR"].sort_values("TWC Coverage (Mo)")
         if twc_ro.empty:
             st.success("No TWC reorders needed.")
         else:
@@ -1353,6 +1102,7 @@ if isinstance(rpt, pd.DataFrame) and not rpt.empty:
     # ── Full Report Table ──
     st.subheader("📋 Full Report Data")
     fmt_full = {
+        "Growth Target %": lambda x: "" if pd.isna(x) else f"{x:.1%}",
         "YoY Sales %": lambda x: "" if pd.isna(x) else f"{x:+.1%}",
         "Sales Pace %": lambda x: "" if pd.isna(x) else f"{x:.0%}",
         "Effort Multiplier": lambda x: "" if pd.isna(x) else f"{x:.2f}x",
@@ -1366,28 +1116,56 @@ if isinstance(rpt, pd.DataFrame) and not rpt.empty:
         "Bonded Est. Reorder Qty": lambda x: "" if pd.isna(x) else f"{x:,.0f}",
         "TWC Est. Reorder Qty": lambda x: "" if pd.isna(x) else f"{x:,.0f}",
     }
-    st.dataframe(rpt.style.format(fmt_full), use_container_width=True)
+    sales_tab, po_tab = st.tabs(["Sales and stock", "Purchase order audit"])
+    full_data = weekly_report_view(rpt)
+    with sales_tab:
+        st.caption("Ordered Qty (PO) shows bottles on purchase orders that are not yet billed, minus bottles of that batch billed on another PO and sold since. Only billed bottles not yet received reduce the supplier reorder suggestion; received stock is counted in warehouse balances.")
+        display_formats = {REPORT_COLUMNS.get(key, key): value for key, value in fmt_full.items()}
+        for column in full_data.select_dtypes(include="number"):
+            display_formats.setdefault(column, "{:,.1f}" if column in {"Avg Weekly Sales", "Annual Target", "Expected YTD Sales", "Target Base Sales"} else "{:,.0f}")
+        st.caption("Colours match the Excel download; its Colour Key sheet explains each one.")
+        st.dataframe(full_data.style.format(display_formats).apply(lambda _: attention_css(full_data), axis=None),
+                     use_container_width=True, hide_index=True)
+    with po_tab:
+        full_audit = purchase_order_audit_view(rpt, st.session_state.get("report_po_audit"))
+        if full_audit.empty:
+            st.info("No purchase-order audit lines are saved with this report.")
+        else:
+            st.caption("Notes show billed and received quantities and the balance applied to reordering. Ordered Qty retains the original PO line quantity, as in the supplied audit.")
+            st.dataframe(full_audit, hide_index=True, use_container_width=True)
 
     # ── Downloads ──
     st.subheader("⬇️ Download Report")
     dl1, dl2, dl3 = st.columns(3)
-    filename_base = f"weekly_report_wk{report_week_display}_{CURRENT_YEAR}"
+    filename_base = f"weekly_report_wk{report_week_display}_{_report_meta.get('report_year', CURRENT_YEAR)}"
     with dl1:
         st.download_button(
-            "📄 CSV", rpt.to_csv(index=False),
+            "📄 Sales and stock CSV", full_data.to_csv(index=False),
             f"{filename_base}.csv", "text/csv",
         )
     with dl2:
         st.download_button(
-            "📊 Excel", df_to_excel(rpt),
+            "📊 Full report Excel (includes PO audit)", df_to_excel(rpt),
             f"{filename_base}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     with dl3:
         st.download_button(
-            "📑 PDF", df_to_pdf(rpt),
+            "📑 PDF", df_to_pdf(full_data),
             f"{filename_base}.pdf", "application/pdf",
         )
 else:
     if not is_admin:
         st.info("📊 No report data available yet. The report will appear here once it has been published.")
+
+
+@st.fragment(run_every=60)
+def _watch_published_report():
+    if st.session_state.get("zoho_job_id"):
+        return
+    source = DATA_DIR / "current_report.json"
+    if source.exists() and source.stat().st_mtime_ns != st.session_state.get("loaded_report_revision"):
+        st.rerun()
+
+
+_watch_published_report()

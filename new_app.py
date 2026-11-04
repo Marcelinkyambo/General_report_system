@@ -5,6 +5,7 @@ import re
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from report_logic import find_closing_stock_quantity_column
 
 # ────────────────────────────────────────────────────────
 # Page config
@@ -244,7 +245,7 @@ def load_and_process(cy_src, py_src, stk_src, purch_cy_src=None, purch_py_src=No
     # ── Find quantity / name columns ──
     qty_cy_col = _find_col(df_cy, ["quantity_sold", "quantity", "qty"])
     qty_py_col = _find_col(df_py, ["quantity_sold", "quantity", "qty"])
-    closing_col = _find_col(df_stock, ["closing stock", "closing_stock", "closing"])
+    closing_col = find_closing_stock_quantity_column(df_stock.columns)
     opening_col = _find_col(df_stock, ["opening stock", "opening_stock", "opening"])
     in_col = _find_col(df_stock, ["quantity in", "quantity_in"])
     out_col = _find_col(df_stock, ["quantity out", "quantity_out"])

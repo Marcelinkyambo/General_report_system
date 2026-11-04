@@ -5,3 +5,4 @@ plotly
 numpy
 openpyxl
 fpdf2
+requests

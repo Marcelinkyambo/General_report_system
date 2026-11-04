@@ -21,3 +21,18 @@ Thumbs.db
 
 # Excel planning files
 *.xlsx
+
+# Credentials and private automated snapshots
+.streamlit/secrets.toml
+.env
+.env.*
+zoho.local.json
+zoho.local.tmp
+data/books_cache/
+Invoice*.csv
+Bill*.csv
+Purchase_Order*.csv
+data/runtime/
+data/snapshots/
+data/current_report.json
+outputs/

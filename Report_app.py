@@ -11,6 +11,7 @@ import re
 from typing import Iterable, Optional
 from datetime import datetime, date  # Added for dynamic date calculations
 from pathlib import Path
+from report_logic import find_closing_stock_quantity_column
 
 # ----------------- Database Connection ----------------- #
 def connect_to_database():
@@ -400,7 +401,7 @@ def generate_general_report(
         stock_item_col = _find_col(stock, ["item", "name"]) or _find_col(stock, ["item_name"])
         stock_cat_col = _find_col(stock, ["category", "name"]) or _find_col(stock, ["category"])
         opening_col = _find_col(stock, ["opening", "stock"]) or _find_col(stock, ["opening"])
-        closing_stock_col = _find_col(stock, ["closing", "stock"]) or _find_col(stock, ["closing"])
+        closing_stock_col = find_closing_stock_quantity_column(stock.columns)
 
         missing = [n for n, c in [
             ("SKU", stock_sku_col),

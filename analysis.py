@@ -4,6 +4,7 @@ import numpy as np
 from io import BytesIO
 from fpdf import FPDF
 from datetime import datetime, date
+from report_logic import find_closing_stock_quantity_column
 
 # =====================================================
 # CONFIG
@@ -146,7 +147,7 @@ if st.button("🚀 Generate Report"):
     stock_item_col = find_column(stock_cy, ["item", "name"]) or find_column(stock_cy, ["item_name"])
     stock_category_col = find_column(stock_cy, ["category", "name"]) or find_column(stock_cy, ["category"])
     opening_col = find_column(stock_cy, ["opening", "stock"]) or find_column(stock_cy, ["opening"])
-    closing_col = find_column(stock_cy, ["closing", "stock"]) or find_column(stock_cy, ["closing"])
+    closing_col = find_closing_stock_quantity_column(stock_cy.columns)
     
     # Sales columns
     sales_item_col = find_column(sales_cy, ["item", "name"]) or find_column(sales_cy, ["item_name"])
