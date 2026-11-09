@@ -3,6 +3,7 @@
 Sales and purchases use dated transactions. Stock is an explicitly dated LIVE
 snapshot of the configured locations, not a reconstruction of historical stock.
 """
+import calendar
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 import hashlib
@@ -560,6 +561,27 @@ def stock_sources(items, groups=None):
     return {key: pd.DataFrame(rows) for key, rows in result.items()}
 
 
+def product_names(items):
+    """Name each combined product (all vintages) after its current vintage.
+
+    That is the vintage holding the most stock; with no stock anywhere, the active
+    and then most recently created item. Otherwise a row could carry the name of an
+    old, inactive vintage while all of its stock belongs to the new one.
+    """
+    best = {}
+    for item in items.values():
+        if not item.get("sku"):
+            continue
+        stock = item.get("stock_on_hand")
+        rank = (max(_number(stock, "stock on hand"), 0) if stock not in (None, "") else 0,
+                str(item.get("status", "")).lower() == "active", str(item.get("created_time", "")))
+        key = sku_to_group_key(item["sku"])
+        if key and (key not in best or rank > best[key][0]):
+            best[key] = (rank, _metadata(item)["item_name"])
+    return pd.DataFrame([{"sku_key": key, "item_name": name} for key, (_, name) in best.items()],
+                        columns=["sku_key", "item_name"])
+
+
 def po_summary_is_relevant(order):
     """Read active POs awaiting goods, including fully billed purchase orders."""
     if str(order.get("status", "")).lower() not in {"approved", "open", "issued", "partially_billed", "partially_received", "billed"}:
@@ -578,8 +600,24 @@ def _bill_line_po(line):
     return "" if "purchaseorder_id" in line and not line["purchaseorder_id"] else None
 
 
-def open_orders(orders, bills, items, sales=None):
-    """Show billed PO quantities and credit only billed units not yet received."""
+# Unbilled bottles on older POs are not shown as on order: those lines are usually never closed.
+PO_UNBILLED_MAX_AGE_MONTHS = 3
+
+
+def months_before(day, months):
+    """The same day `months` calendar months earlier, clamped to the end of a shorter month."""
+    month_index = day.year * 12 + day.month - 1 - months
+    year, month = divmod(month_index, 12)
+    return date(year, month + 1, min(day.day, calendar.monthrange(year, month + 1)[1]))
+
+
+def open_orders(orders, bills, items, sales=None, as_of=None):
+    """Show billed PO quantities and credit only billed units not yet received.
+
+    With `as_of`, unbilled quantities on POs dated more than PO_UNBILLED_MAX_AGE_MONTHS
+    before it are not counted as on order. Billed units awaiting receipt still count.
+    """
+    unbilled_since = months_before(as_of, PO_UNBILLED_MAX_AGE_MONTHS).isoformat() if as_of else None
     billed, batch_bills, batch_sales = {}, {}, {}
     for bill in bills:
         for line in bill.get("line_items", []):
@@ -631,7 +669,8 @@ def open_orders(orders, bills, items, sales=None):
             other_bills = [b for b in batch_bills.get(str(line["item_id"]), []) if b[0] >= po_date and b[1] != po_number]
             sold_since = sum(q for day, q in batch_sales.get(item["sku"], []) if day >= po_date)
             arrived = min(unbilled, sum(b[3] for b in other_bills)) if sold_since > 0 else 0
-            counted = unbilled - arrived
+            too_old = unbilled_since is not None and po_date < unbilled_since
+            counted = 0 if too_old else unbilled - arrived
             unreceived = max(qty - cancelled - received - marked_received, 0) if received is not None else None
             remaining = max(consumed - (received or 0) - marked_received, 0)
             key = sku_to_group_key(item["sku"])
@@ -653,7 +692,10 @@ def open_orders(orders, bills, items, sales=None):
                           "Billed Quantity Source": "Books PO quantity_billed" if native_billed is not None else "Bill line links",
                           "Match": "Exact Books item ID",
                           "Notes": f"Billed {consumed:g}; received {(received or 0) + marked_received:g}; for reorder {remaining:g}."
-                                   + (f" {arrived:g} of {unbilled:g} unbilled ignored: this batch was billed on "
+                                   + (f" {unbilled:g} unbilled not counted as on order: the PO is more than "
+                                      f"{PO_UNBILLED_MAX_AGE_MONTHS} months old (dated before {unbilled_since})."
+                                      if too_old and unbilled else
+                                      f" {arrived:g} of {unbilled:g} unbilled ignored: this batch was billed on "
                                       + ", ".join(sorted({f"{p or 'no PO'} (bill {n or '?'})" for _, p, n, _ in other_bills}))
                                       + f" and {sold_since:g} sold since the PO date." if arrived else "")})
     quantities = ["open_po_qty", "billed_po_qty", "unbilled_po_qty"]
@@ -669,6 +711,8 @@ def fetch_weekly_inputs(client, as_of, today):
     if cached is not None and client.config.warehouse_mapping_mode == "names" \
             and cached[2].get("warehouse_rules") != WAREHOUSE_RULES:
         cached = _regroup_saved_stock(client, as_of, cached)
+    if cached is not None and "product_names" not in cached[0]:
+        cached = _add_saved_product_names(client, as_of, cached)
     if cached is not None:
         client.progress("Using complete saved Books data; no Zoho requests needed")
         return cached
@@ -695,6 +739,17 @@ def _regroup_saved_stock(client, as_of, cached):
     metadata = {**metadata, "warehouse_groups": groups, "warehouse_rules": WAREHOUSE_RULES}
     save_weekly_snapshot(client, as_of, (inputs, audit, metadata))
     client.progress("Re-grouped saved warehouse stock under the current warehouse rules")
+    return inputs, audit, metadata
+
+
+def _add_saved_product_names(client, as_of, cached):
+    """Name saved products from the same item snapshot. Older pulls keep their names if it is gone."""
+    inputs, audit, metadata = cached
+    items = load_item_snapshot_at(client, metadata.get("stock_snapshot_at"))
+    if items is None:
+        return cached
+    inputs = {**inputs, "product_names": product_names(items)}
+    save_weekly_snapshot(client, as_of, (inputs, audit, metadata))
     return inputs, audit, metadata
 
 
@@ -747,11 +802,14 @@ def _fetch_weekly_inputs(client, as_of, today):
     kinds = {"sales_cy": "sales", "sales_py": "sales", **STOCK_KINDS, "item_details": "metadata",
              "purchases_cy": "purchases", "purchases_py": "purchases"}
     inputs = {key: prepare_source(frame, kinds[key]) for key, frame in sources.items()}
-    inputs["purchase_orders"], audit = open_orders(orders, bills, items, pd.concat([previous_year, current], ignore_index=True))
+    inputs["product_names"] = product_names(items)
+    inputs["purchase_orders"], audit = open_orders(orders, bills, items, pd.concat([previous_year, current], ignore_index=True),
+                                                   as_of=today)
     metadata = {"source": "Zoho Books", "organization_id": client.config.organization_id,
                 "sales_as_of": as_of.isoformat(), "stock_as_of": today.isoformat(), "po_as_of": today.isoformat(),
                 "stock_basis": "Books location stock_on_hand", "synced_at": datetime.now(timezone.utc).isoformat(),
                 "po_quantity_basis": PO_QUANTITY_BASIS,
+                "po_unbilled_since": months_before(today, PO_UNBILLED_MAX_AGE_MONTHS).isoformat(),
                 "po_scope": "Active approved POs awaiting receipt, including fully billed POs",
                 "warehouse_mapping_mode": client.config.warehouse_mapping_mode, "warehouse_groups": groups,
                 "warehouse_rules": WAREHOUSE_RULES,

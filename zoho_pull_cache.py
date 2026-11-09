@@ -33,7 +33,7 @@ def _read(path, minutes=None):
 
 
 # Bump when PO quantities change meaning, so saved pulls without the new fields are re-read.
-PO_QUANTITY_BASIS = "billed_with_unreceived_credit_v3_batch_bills_capped"
+PO_QUANTITY_BASIS = "billed_with_unreceived_credit_v4_unbilled_last_3_months"
 
 
 def load_item_snapshot(client):

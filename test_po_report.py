@@ -1,4 +1,5 @@
 from copy import deepcopy
+from datetime import date
 from io import BytesIO
 from tempfile import TemporaryDirectory
 import unittest
@@ -9,7 +10,7 @@ import pandas as pd
 from report_store import AUDIT_COLUMNS, REPORT_COLUMNS, load_report, publish_report, purchase_order_audit, report_excel_bytes
 import test_automation
 from weekly_pipeline import build_weekly_report
-from zoho_books import ZohoError, open_orders, po_summary_is_relevant
+from zoho_books import ZohoError, months_before, open_orders, po_summary_is_relevant
 
 EXPECTED_REPORT_HEADERS = [
     'SKU', 'Item Name', 'Category', 'Country', 'Brand', 'Current Year Sales YTD', 'Previous Year Sales YTD',
@@ -41,6 +42,35 @@ class PurchaseOrderReportTests(unittest.TestCase):
         # 100 ordered - 10 cancelled - 60 billed leaves 30 bottles not yet billed.
         self.assertEqual(report["Ordered Qty (PO)"].iloc[0], 30)
         self.assertEqual(report["Bonded Est. Reorder Qty"].iloc[0], before["Bonded Est. Reorder Qty"].iloc[0] - 20)
+
+    def aged_orders(self, as_of):
+        # Man Chardonnay: PO-2025-00050 (July 2025) still has 180 unbilled; a recent PO has 240.
+        items = {"24": {"sku": "039-002-24", "name": "Man Chardonnay 2024"},
+                 "26": {"sku": "039-002-26", "name": "Man Chardonnay 2026"}}
+        orders = [{"status": "partially_billed", "purchaseorder_number": "PO-2025-00050", "date": "2025-07-23",
+                   "line_items": [{"item_id": "24", "line_item_id": "L1", "quantity": 180, "quantity_billed": 0, "quantity_received": 0},
+                                  {"item_id": "24", "line_item_id": "L2", "quantity": 100, "quantity_billed": 60, "quantity_received": 40}]},
+                  {"status": "approved", "purchaseorder_number": "PO-2026-00140", "date": "2026-08-09",
+                   "line_items": [{"item_id": "26", "line_item_id": "L3", "quantity": 240, "quantity_billed": 0, "quantity_received": 0}]}]
+        return open_orders(orders, [], items, as_of=as_of)
+
+    def test_unbilled_bottles_on_pos_older_than_three_months_are_not_on_order(self):
+        totals, audit = self.aged_orders(date(2026, 11, 9))
+        # The 9 August PO is exactly three months old and still counts; July 2025 does not.
+        self.assertEqual(totals.unbilled_po_qty.iloc[0], 240)
+        # 60 billed - 40 received on the old PO still reduce reordering.
+        self.assertEqual(totals.open_po_qty.iloc[0], 20)
+        old = audit.set_index("Line ID").loc["L1"]
+        self.assertEqual((old["Unbilled Qty"], old["Unbilled Qty Counted"]), (180, 0))
+        self.assertIn("more than 3 months old (dated before 2026-08-09)", old["Notes"])
+        self.assertEqual(audit.set_index("Line ID").loc["L3", "Unbilled Qty Counted"], 240)
+        # One day later the August PO is older than three months too.
+        self.assertEqual(self.aged_orders(date(2026, 11, 10))[0].unbilled_po_qty.iloc[0], 0)
+
+    def test_three_month_cutoff_clamps_to_month_end_and_crosses_years(self):
+        self.assertEqual(months_before(date(2026, 5, 31), 3), date(2026, 2, 28))
+        self.assertEqual(months_before(date(2024, 5, 31), 3), date(2024, 2, 29))
+        self.assertEqual(months_before(date(2027, 1, 15), 3), date(2026, 10, 15))
 
     def batch_check(self, bills, sales):
         # Monin Caramel: old PO-2025-00074 for 180 was never closed; the bottles came in on PO-2026-00055.

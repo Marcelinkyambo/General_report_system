@@ -13,7 +13,7 @@ def build_weekly_report(inputs, weeks_elapsed, growth_pct=.2, brand_rates=None):
     if not 0 < weeks_elapsed <= 52:
         raise ValueError("Weeks elapsed must be greater than zero and no more than 52.")
     keys = ["sales_cy", "sales_py", "stock_cy", "stock_py", "purchases_cy", "purchases_py",
-            "twc_stock", "bonded_stock_file", "in_transit", "item_details", "planning"]
+            "twc_stock", "bonded_stock_file", "in_transit", "item_details", "planning", "product_names"]
     inputs = {**{key: pd.DataFrame() for key in keys}, **inputs}
     for key in keys:
         frame = inputs[key]
@@ -153,6 +153,12 @@ def build_weekly_report(inputs, weeks_elapsed, growth_pct=.2, brand_rates=None):
             else:
                 df[col] = df[meta_col]
             df.drop(columns=[meta_col], inplace=True)
+
+    # Rows combine vintages: when the source names each product's current vintage, use it.
+    names = inputs["product_names"]
+    if not names.empty:
+        current_name = df["sku_key"].map(names.set_index("sku_key")["item_name"])
+        df["item_name"] = current_name.where(current_name.notna(), df.get("item_name"))
 
     # ── Metadata enrichment for non-sales items ──
     for col in ["brand", "country_of_origin"]:
@@ -386,7 +392,7 @@ def build_weekly_report(inputs, weeks_elapsed, growth_pct=.2, brand_rates=None):
         "Bonded Est. Reorder Qty": df["bonded_est_reorder_qty"],
         "TWC Est. Reorder Qty": df["twc_est_reorder_qty"],
         # Purchases
-        # Bottles still on order with the supplier: ordered, not cancelled and not yet billed.
+        # Bottles still on order with the supplier: ordered, not cancelled and not yet billed, on POs from the last 3 months.
         "Ordered Qty (PO)": df["unbilled_po_qty"],
         "Billed Qty (PO)": df["billed_po_qty"],
         "PO Reorder Credit Qty": df["open_po_qty"],

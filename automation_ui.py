@@ -80,7 +80,7 @@ def render_pull_progress():
         result = job.result
         if result["kind"] == "weekly":
             inputs, audit, metadata = result["payload"]
-            for key in ["sales_cy", "sales_py", "stock_cy", "stock_py", "purchases_cy", "purchases_py", "twc_stock", "bonded_stock_file", "in_transit", "item_details", "planning", "purchase_orders"]:
+            for key in ["sales_cy", "sales_py", "stock_cy", "stock_py", "purchases_cy", "purchases_py", "twc_stock", "bonded_stock_file", "in_transit", "item_details", "planning", "purchase_orders", "product_names"]:
                 st.session_state[key] = inputs.get(key, pd.DataFrame()).copy()
             st.session_state["po_audit"] = audit.copy()
             st.session_state["source_metadata"] = dict(metadata)

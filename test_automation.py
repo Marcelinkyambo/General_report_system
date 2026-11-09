@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -12,7 +12,7 @@ from planning import apply_brand_targets, brand_history, build_annual_plan, load
 from report_inputs import prepare_source
 from report_store import load_report, publish_report, report_excel_bytes, weekly_report_view
 from weekly_pipeline import build_weekly_report
-from zoho_books import BooksClient, BooksConfig, ZohoError, ZohoResponseError, fetch_annual_sales, fetch_weekly_inputs, open_orders, stock_sources, transaction_rows, groups_from_warehouse_names, warehouse_group, check_read_access, exchange_grant_code, response_records, load_items
+from zoho_books import BooksClient, BooksConfig, ZohoError, ZohoResponseError, fetch_annual_sales, fetch_weekly_inputs, open_orders, product_names, stock_sources, transaction_rows, groups_from_warehouse_names, warehouse_group, check_read_access, exchange_grant_code, response_records, load_items
 
 
 class PlanningTests(unittest.TestCase):
@@ -302,6 +302,32 @@ class BooksTests(unittest.TestCase):
         self.assertEqual(sources["in_transit"].closing_stock.iloc[0], 20)
         self.assertEqual(sources["twc_stock"].closing_stock.iloc[0], 50)
 
+    def test_combined_vintages_are_named_after_the_vintage_holding_the_stock(self):
+        # Sales list the old vintage first; all stock is the new vintage in transit.
+        items = {"23": {"sku": "039-002-23", "name": "Man Chardonnay 2023", "status": "inactive", "stock_on_hand": 0,
+                        "created_time": "2024-04-25T14:29:46+0200"},
+                 "25": {"sku": "039-002-25", "name": "Man Chardonnay 2025", "status": "active", "stock_on_hand": 0,
+                        "created_time": "2025-10-16T11:09:33+0200"},
+                 "26": {"sku": "039-002-26", "name": "Man Chardonnay 2026", "status": "active", "stock_on_hand": 360,
+                        "created_time": "2026-09-04T15:57:04+0200"},
+                 # Sold out everywhere: the active vintage, then the newest one.
+                 "a": {"sku": "040-002-20", "name": "Glenelly Merlot 2020", "status": "inactive", "stock_on_hand": 0, "created_time": "2023"},
+                 "b": {"sku": "040-002-21", "name": "Glenelly Merlot 2021", "status": "active", "stock_on_hand": 0, "created_time": "2024"},
+                 "c": {"sku": "040-002-22", "name": "Glenelly Merlot 2022", "status": "inactive", "stock_on_hand": 0, "created_time": "2025"}}
+        names = product_names(items).set_index("sku_key").item_name
+        self.assertEqual(names["039002"], "Man Chardonnay 2026")
+        self.assertEqual(names["040002"], "Glenelly Merlot 2021")
+        sales = pd.DataFrame({"sku": ["039-002-23", "039-002-25"], "item_name": ["Man Chardonnay 2023", "Man Chardonnay 2025"],
+                              "quantity_sold": [1, 5], "amount": [10, 50]})
+        stock = pd.DataFrame({"sku": ["039-002-26"], "item_name": ["Man Chardonnay 2026"], "closing_stock": [360]})
+        transit = pd.DataFrame({"sku": ["039-002-26"], "closing_stock": [360]})
+        report, _ = build_weekly_report({"sales_cy": prepare_source(sales, "sales"), "stock_cy": prepare_source(stock, "stock"),
+                                         "in_transit": prepare_source(transit, "in_transit_qty"),
+                                         "product_names": product_names(items)}, 26)
+        row = report.set_index("SKU").loc["039-002"]
+        self.assertEqual(row["Item Name"], "Man Chardonnay 2026")
+        self.assertEqual((row["CY Sales (YTD)"], row["Total Stock"], row["In Transit"]), (6, 360, 360))
+
     def test_unnamed_warehouses_are_not_silently_assigned_to_cleared(self):
         items = {"1": {"locations": [{"location_id": "b", "location_name": ""}]}}
         with self.assertRaisesRegex(ZohoError, "without a name"):
@@ -521,10 +547,13 @@ class BooksPipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(inputs["sales_py"].quantity_sold.iloc[0], 5)
         self.assertEqual(inputs["stock_cy"].closing_stock.iloc[0], 20)
         self.assertEqual(inputs["in_transit"].in_transit_qty.iloc[0], 10)
-        self.assertEqual(metadata["stock_as_of"], "2026-10-30")
+        # Stock is dated by the snapshot actually taken (South Africa date), not the sales cutoff.
+        snapshot_day = datetime.fromisoformat(metadata["stock_snapshot_at"]).astimezone(timezone(timedelta(hours=2))).date()
+        self.assertEqual(metadata["stock_as_of"], snapshot_day.isoformat())
         self.assertEqual(metadata["sales_as_of"], "2026-10-25")
         report, _ = build_weekly_report(inputs, elapsed_weeks(date(2026, 10, 25)))
         self.assertEqual(report["Total Stock"].iloc[0], 20)
+        self.assertEqual(report["Item Name"].iloc[0], "Wine")
 
 
 class BackgroundPullTests(unittest.TestCase):

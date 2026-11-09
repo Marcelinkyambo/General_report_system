@@ -62,7 +62,7 @@ COLOUR_KEY = [  # (style, example, column, meaning)
     ("neutral", "MEDIUM", "Stockout Risk", "Stock runs out in 4-8 weeks"),
     ("reorder", "REORDER", "Reorder from Supplier", "Order from the supplier"),
     ("reorder_qty", "240", "Qty to order from Supplier", "Bottles to order, after billed POs not yet received"),
-    ("up", "120", "Ordered Qty (PO)", "Bottles on POs not yet billed (minus bottles of that batch billed on another PO and sold since)"),
+    ("up", "120", "Ordered Qty (PO)", "Bottles not yet billed on POs from the last 3 months (minus bottles of that batch billed on another PO and sold since)"),
     ("clear", "CLEAR", "Clear bonded stock", "Clear stock out of bond"),
     ("clear_qty", "60", "Qty to be cleared from Bond", "Bottles to clear from bond"),
     ("bad", "047-003", "SKU", "Product needs a supplier reorder"),

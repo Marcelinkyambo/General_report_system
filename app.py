@@ -271,7 +271,7 @@ if is_admin:
     if st.session_state.get("input_source_mode", source_mode) != source_mode:
         for key in _state_keys:
             st.session_state[key] = pd.DataFrame()
-        for key in ["source_metadata", "purchase_orders", "po_audit"]:
+        for key in ["source_metadata", "purchase_orders", "po_audit", "product_names"]:
             st.session_state.pop(key, None)
     st.session_state["input_source_mode"] = source_mode
     if source_mode == "Zoho Books":
@@ -769,7 +769,8 @@ if is_admin and (_generate_clicked or _generate_from_zoho):
             raise ValueError(st.session_state["planning_error"])
         report, health_stats = build_weekly_report(
             {key: st.session_state[key] for key in _state_keys} | {
-                "purchase_orders": st.session_state.get("purchase_orders", pd.DataFrame())
+                "purchase_orders": st.session_state.get("purchase_orders", pd.DataFrame()),
+                "product_names": st.session_state.get("product_names", pd.DataFrame()),
             },
             weeks_elapsed=weeks_elapsed, growth_pct=growth_pct,
             brand_rates=load_growth(BRAND_GROWTH_FILE, report_year),
@@ -1119,7 +1120,7 @@ if isinstance(rpt, pd.DataFrame) and not rpt.empty:
     sales_tab, po_tab = st.tabs(["Sales and stock", "Purchase order audit"])
     full_data = weekly_report_view(rpt)
     with sales_tab:
-        st.caption("Ordered Qty (PO) shows bottles on purchase orders that are not yet billed, minus bottles of that batch billed on another PO and sold since. Only billed bottles not yet received reduce the supplier reorder suggestion; received stock is counted in warehouse balances.")
+        st.caption("Ordered Qty (PO) shows bottles not yet billed on purchase orders from the last 3 months, minus bottles of that batch billed on another PO and sold since. Unbilled lines on older POs are not counted. Only billed bottles not yet received reduce the supplier reorder suggestion; received stock is counted in warehouse balances.")
         display_formats = {REPORT_COLUMNS.get(key, key): value for key, value in fmt_full.items()}
         for column in full_data.select_dtypes(include="number"):
             display_formats.setdefault(column, "{:,.1f}" if column in {"Avg Weekly Sales", "Annual Target", "Expected YTD Sales", "Target Base Sales"} else "{:,.0f}")
