@@ -74,6 +74,23 @@ class PullCacheTests(unittest.TestCase):
             Path(directory, next(Path(directory).iterdir()).name, "item_stock.json").unlink()
             self.assertEqual(fetch_weekly_inputs(client, DAY, TODAY)[0]["in_transit"].in_transit_qty.tolist(), [1320])
 
+    def test_saved_pull_from_before_the_discontinued_list_reads_it_from_its_item_snapshot(self):
+        with TemporaryDirectory() as directory:
+            client = BooksClient(config(), cache_dir=directory, cache_only=True, session=FakeSession([]))
+            save_item_snapshot(client, {"1": {"item_id": "1", "sku": "001-002-24", "status": "active",
+                                              "cf_discontinued": "true", "cf_discontinued_unformatted": True},
+                                        "2": {"item_id": "2", "sku": "001-003-25", "status": "active",
+                                              "cf_new": "true", "cf_new_unformatted": True}})
+            inputs, audit, metadata = self.result()
+            save_weekly_snapshot(client, DAY, (inputs, audit, {**metadata, "stock_snapshot_at": client.stock_snapshot_at}))
+            inputs = fetch_weekly_inputs(client, DAY, TODAY)[0]
+            self.assertEqual((inputs["discontinued"].sku_key.tolist(), inputs["new"].sku_key.tolist()), (["001002"], ["001003"]))
+            self.assertEqual(client.calls, 0)
+            # They are saved with the pull, so later runs no longer need the item snapshot.
+            Path(directory, next(Path(directory).iterdir()).name, "item_stock.json").unlink()
+            inputs = fetch_weekly_inputs(client, DAY, TODAY)[0]
+            self.assertEqual((inputs["discontinued"].sku_key.tolist(), inputs["new"].sku_key.tolist()), (["001002"], ["001003"]))
+
     def test_saved_pull_without_batch_bill_and_sales_checks_is_not_reused(self):
         with TemporaryDirectory() as directory:
             client = BooksClient(config(), cache_dir=directory, cache_only=True, session=FakeSession([]))

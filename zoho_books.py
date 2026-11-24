@@ -582,6 +582,56 @@ def product_names(items):
                         columns=["sku_key", "item_name"])
 
 
+# Item tick boxes: "Discontinued" items will no longer be bought from the supplier;
+# "NEW" items are newly added to the portfolio.
+DISCONTINUED_FIELD = "cf_discontinued"
+NEW_FIELD = "cf_new"
+
+
+def _ticked(item, field):
+    """Whether an item tick box is ticked in Books.
+
+    The item list returns it only on ticked items (e.g. "cf_new" "true",
+    "cf_new_unformatted" true); item details return it in custom_fields.
+    """
+    values = [item.get(field + "_unformatted"), item.get(field)]
+    values += [entry.get("value") for entry in item.get("custom_fields") or [] if entry.get("api_name") == field]
+    return any(value is True or str(value).strip().lower() == "true" for value in values if value is not None)
+
+
+def is_discontinued(item):
+    return _ticked(item, DISCONTINUED_FIELD)
+
+
+def is_new(item):
+    return _ticked(item, NEW_FIELD)
+
+
+def new_products(items):
+    """Combined products (all vintages) with any vintage ticked NEW."""
+    keys = {sku_to_group_key(item["sku"]) for item in items.values() if item.get("sku") and is_new(item)}
+    return pd.DataFrame({"sku_key": sorted(key for key in keys if key)}, columns=["sku_key"])
+
+
+def discontinued_products(items):
+    """Combined products (all vintages) that are no longer bought from the supplier.
+
+    A product is discontinued when every active vintage is ticked Discontinued.
+    Inactive vintages are ignored, so a new, unticked vintage brings the product
+    back. A product with no active vintage needs every vintage ticked.
+    """
+    vintages = {}
+    for item in items.values():
+        if item.get("sku"):
+            vintages.setdefault(sku_to_group_key(item["sku"]), []).append(item)
+    keys = []
+    for key, group in vintages.items():
+        active = [item for item in group if str(item.get("status", "")).lower() == "active"] or group
+        if key and all(is_discontinued(item) for item in active):
+            keys.append(key)
+    return pd.DataFrame({"sku_key": sorted(keys)}, columns=["sku_key"])
+
+
 def po_summary_is_relevant(order):
     """Read active POs awaiting goods, including fully billed purchase orders."""
     if str(order.get("status", "")).lower() not in {"approved", "open", "issued", "partially_billed", "partially_received", "billed"}:
@@ -711,8 +761,8 @@ def fetch_weekly_inputs(client, as_of, today):
     if cached is not None and client.config.warehouse_mapping_mode == "names" \
             and cached[2].get("warehouse_rules") != WAREHOUSE_RULES:
         cached = _regroup_saved_stock(client, as_of, cached)
-    if cached is not None and "product_names" not in cached[0]:
-        cached = _add_saved_product_names(client, as_of, cached)
+    if cached is not None and not ITEM_INPUTS.keys() <= cached[0].keys():
+        cached = _add_saved_item_inputs(client, as_of, cached)
     if cached is not None:
         client.progress("Using complete saved Books data; no Zoho requests needed")
         return cached
@@ -742,13 +792,17 @@ def _regroup_saved_stock(client, as_of, cached):
     return inputs, audit, metadata
 
 
-def _add_saved_product_names(client, as_of, cached):
-    """Name saved products from the same item snapshot. Older pulls keep their names if it is gone."""
+# Report inputs taken from the item master. Saved pulls made before one existed get it from their item snapshot.
+ITEM_INPUTS = {"product_names": product_names, "discontinued": discontinued_products, "new": new_products}
+
+
+def _add_saved_item_inputs(client, as_of, cached):
+    """Add missing item-master inputs from the same item snapshot. Without it, older pulls stay as they were."""
     inputs, audit, metadata = cached
     items = load_item_snapshot_at(client, metadata.get("stock_snapshot_at"))
     if items is None:
         return cached
-    inputs = {**inputs, "product_names": product_names(items)}
+    inputs = {**inputs, **{key: build(items) for key, build in ITEM_INPUTS.items() if key not in inputs}}
     save_weekly_snapshot(client, as_of, (inputs, audit, metadata))
     return inputs, audit, metadata
 
@@ -803,6 +857,8 @@ def _fetch_weekly_inputs(client, as_of, today):
              "purchases_cy": "purchases", "purchases_py": "purchases"}
     inputs = {key: prepare_source(frame, kinds[key]) for key, frame in sources.items()}
     inputs["product_names"] = product_names(items)
+    inputs["discontinued"] = discontinued_products(items)
+    inputs["new"] = new_products(items)
     inputs["purchase_orders"], audit = open_orders(orders, bills, items, pd.concat([previous_year, current], ignore_index=True),
                                                    as_of=today)
     metadata = {"source": "Zoho Books", "organization_id": client.config.organization_id,

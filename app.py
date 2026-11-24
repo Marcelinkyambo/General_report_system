@@ -16,7 +16,7 @@ from weekly_pipeline import build_weekly_report
 from planning import prepare_planning, brand_history, brand_key, load_growth, save_growth
 from automation_ui import render_zoho_source, render_brand_editor, render_pull_progress
 from automate_report import elapsed_weeks as elapsed_weeks_at_cutoff, load_year_plan, local_today
-from report_store import attention_css, load_report, publish_report, report_excel_bytes, weekly_report_view, purchase_order_audit_view, REPORT_COLUMNS
+from report_store import attention_css, item_status, load_report, publish_report, report_excel_bytes, weekly_report_view, purchase_order_audit_view, REPORT_COLUMNS
 from report_logic import (
     apply_reorder_flags,
     apply_stock_coverage,
@@ -271,7 +271,7 @@ if is_admin:
     if st.session_state.get("input_source_mode", source_mode) != source_mode:
         for key in _state_keys:
             st.session_state[key] = pd.DataFrame()
-        for key in ["source_metadata", "purchase_orders", "po_audit", "product_names"]:
+        for key in ["source_metadata", "purchase_orders", "po_audit", "product_names", "discontinued", "new"]:
             st.session_state.pop(key, None)
     st.session_state["input_source_mode"] = source_mode
     if source_mode == "Zoho Books":
@@ -771,6 +771,8 @@ if is_admin and (_generate_clicked or _generate_from_zoho):
             {key: st.session_state[key] for key in _state_keys} | {
                 "purchase_orders": st.session_state.get("purchase_orders", pd.DataFrame()),
                 "product_names": st.session_state.get("product_names", pd.DataFrame()),
+                "discontinued": st.session_state.get("discontinued", pd.DataFrame()),
+                "new": st.session_state.get("new", pd.DataFrame()),
             },
             weeks_elapsed=weeks_elapsed, growth_pct=growth_pct,
             brand_rates=load_growth(BRAND_GROWTH_FILE, report_year),
@@ -975,6 +977,8 @@ if isinstance(rpt, pd.DataFrame) and not rpt.empty:
             )
 
     with st.expander("🔄 Bonded Warehouse Reorders", expanded=False):
+        if hs.get("discontinued"):
+            st.caption(f"{hs['discontinued']:,} products ticked Discontinued in Zoho Books are never reordered from the supplier.")
         bonded_ro = rpt[rpt["Bonded Reorder"] == "REORDER"].sort_values("Stock Coverage (Mo)")
         if bonded_ro.empty:
             st.success("No bonded reorders needed.")
@@ -1124,8 +1128,10 @@ if isinstance(rpt, pd.DataFrame) and not rpt.empty:
         display_formats = {REPORT_COLUMNS.get(key, key): value for key, value in fmt_full.items()}
         for column in full_data.select_dtypes(include="number"):
             display_formats.setdefault(column, "{:,.1f}" if column in {"Avg Weekly Sales", "Annual Target", "Expected YTD Sales", "Target Base Sales"} else "{:,.0f}")
-        st.caption("Colours match the Excel download; its Colour Key sheet explains each one.")
-        st.dataframe(full_data.style.format(display_formats).apply(lambda _: attention_css(full_data), axis=None),
+        st.caption("Colours match the Excel download; its Colour Key sheet explains each one. "
+                   "Item Name is red for items ticked Discontinued and blue for items ticked NEW in Zoho Books.")
+        full_status = item_status(rpt)
+        st.dataframe(full_data.style.format(display_formats).apply(lambda _: attention_css(full_data, full_status), axis=None),
                      use_container_width=True, hide_index=True)
     with po_tab:
         full_audit = purchase_order_audit_view(rpt, st.session_state.get("report_po_audit"))

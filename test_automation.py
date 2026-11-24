@@ -10,9 +10,9 @@ import pandas as pd
 from automate_report import elapsed_weeks
 from planning import apply_brand_targets, brand_history, build_annual_plan, load_growth, prepare_planning, save_growth
 from report_inputs import prepare_source
-from report_store import load_report, publish_report, report_excel_bytes, weekly_report_view
+from report_store import load_report, publish_report, purchase_order_audit, report_excel_bytes, weekly_report_view
 from weekly_pipeline import build_weekly_report
-from zoho_books import BooksClient, BooksConfig, ZohoError, ZohoResponseError, fetch_annual_sales, fetch_weekly_inputs, open_orders, product_names, stock_sources, transaction_rows, groups_from_warehouse_names, warehouse_group, check_read_access, exchange_grant_code, response_records, load_items
+from zoho_books import BooksClient, BooksConfig, ZohoError, ZohoResponseError, fetch_annual_sales, fetch_weekly_inputs, open_orders, product_names, discontinued_products, is_discontinued, is_new, new_products, stock_sources, transaction_rows, groups_from_warehouse_names, warehouse_group, check_read_access, exchange_grant_code, response_records, load_items
 
 
 class PlanningTests(unittest.TestCase):
@@ -328,6 +328,33 @@ class BooksTests(unittest.TestCase):
         self.assertEqual(row["Item Name"], "Man Chardonnay 2026")
         self.assertEqual((row["CY Sales (YTD)"], row["Total Stock"], row["In Transit"]), (6, 360, 360))
 
+    def test_discontinued_tick_box_is_read_from_the_item_list_or_item_details(self):
+        self.assertTrue(is_discontinued({"cf_discontinued": "true", "cf_discontinued_unformatted": True}))
+        self.assertTrue(is_discontinued({"custom_fields": [{"api_name": "cf_discontinued", "value": True}]}))
+        self.assertFalse(is_discontinued({"custom_fields": [{"api_name": "cf_discontinued", "value": False}]}))
+        # Unticked items have no Discontinued value in the item list at all.
+        self.assertFalse(is_discontinued({"sku": "047-003-24", "cf_retail_price": 10}))
+
+    def test_product_is_discontinued_only_when_every_active_vintage_is_ticked(self):
+        ticked = {"cf_discontinued_unformatted": True}
+        items = {"a": {"sku": "001-001-21", "status": "inactive"}, "b": {"sku": "001-001-22", "status": "active", **ticked},
+                 # A new, unticked vintage keeps the product on supplier reorders.
+                 "c": {"sku": "002-001-22", "status": "active", **ticked}, "d": {"sku": "002-001-23", "status": "active"},
+                 "e": {"sku": "003-001-20", "status": "inactive", **ticked}, "f": {"sku": "003-001-21", "status": "inactive", **ticked},
+                 "g": {"sku": "004-001-20", "status": "inactive", **ticked}, "h": {"sku": "004-001-21", "status": "inactive"},
+                 "i": {"sku": "005-001-20", "status": "active"}, "j": {"name": "Grape Points", **ticked}}
+        self.assertEqual(discontinued_products(items).sku_key.tolist(), ["001001", "003001"])
+        self.assertEqual(discontinued_products({}).columns.tolist(), ["sku_key"])
+
+    def test_product_is_new_when_any_vintage_is_ticked_new(self):
+        self.assertTrue(is_new({"cf_new": "true", "cf_new_unformatted": True}))
+        self.assertTrue(is_new({"custom_fields": [{"api_name": "cf_new", "value": True}]}))
+        self.assertFalse(is_new({"cf_discontinued_unformatted": True}))
+        items = {"a": {"sku": "001-001-24", "status": "inactive"}, "b": {"sku": "001-001-25", "cf_new_unformatted": True},
+                 "c": {"sku": "002-001-25"}, "d": {"name": "Grape Points", "cf_new_unformatted": True}}
+        self.assertEqual(new_products(items).sku_key.tolist(), ["001001"])
+        self.assertEqual(new_products({}).columns.tolist(), ["sku_key"])
+
     def test_unnamed_warehouses_are_not_silently_assigned_to_cleared(self):
         items = {"1": {"locations": [{"location_id": "b", "location_name": ""}]}}
         with self.assertRaisesRegex(ZohoError, "without a name"):
@@ -497,6 +524,75 @@ class PipelineAndPublicationTests(unittest.TestCase):
                                        check_names=False)
         pd.testing.assert_series_equal(view["Cleared Stock Weeks Coverage"], view["Cleared Stock"] / rate, check_names=False)
 
+    def test_discontinued_products_are_never_reordered_from_the_supplier(self):
+        from io import BytesIO
+        import openpyxl
+        skus = ["047-003-24", "048-001-24"]
+        stock = pd.DataFrame({"sku": skus, "closing_stock": [10, 10]})
+        inputs = {"sales_cy": prepare_source(pd.DataFrame({"sku": skus, "quantity_sold": [50, 50], "amount": [1000, 1000]}), "sales"),
+                  "stock_cy": prepare_source(stock, "stock"), "bonded_stock_file": prepare_source(stock, "bonded_stock_uploaded"),
+                  "twc_stock": prepare_source(stock.assign(closing_stock=0), "twc_stock"),
+                  "purchase_orders": pd.DataFrame({"sku_key": ["048001"], "open_po_qty": [5]}),
+                  "discontinued": pd.DataFrame({"sku_key": ["048001"]})}
+        report, health = build_weekly_report(inputs, 26)
+        rows = report.set_index("SKU")
+        self.assertEqual(rows.loc["047-003", "Bonded Reorder"], "REORDER")
+        self.assertGreater(rows.loc["047-003", "Bonded Est. Reorder Qty"], 0)
+        ended = rows.loc["048-001"]
+        self.assertEqual((ended["Bonded Reorder"], ended["Bonded Est. Reorder Qty"], ended["Supplier Need Before PO"]), ("", 0, 0))
+        self.assertEqual((ended["Discontinued"], rows.loc["047-003", "Discontinued"]), ("Yes", ""))
+        # Its remaining bonded bottles can still be cleared and sold.
+        self.assertEqual(ended["TWC Reorder"], "CLEAR")
+        self.assertEqual(ended["TWC Est. Reorder Qty"], rows.loc["047-003", "TWC Est. Reorder Qty"])
+        self.assertEqual((health["reorder_bonded"], health["reorder_twc"], health["discontinued"]), (1, 2, 1))
+        workbook = openpyxl.load_workbook(BytesIO(report_excel_bytes(report)))
+        self.assertEqual([row[0] for row in workbook["Supplier Reorders"].iter_rows(min_row=2, values_only=True)], ["047-003"])
+        self.assertEqual(len(weekly_report_view(report).columns), 26)
+        audit = purchase_order_audit(report, pd.DataFrame({"SKU": ["048-001-24"], "Outstanding Qty": [5]}))
+        self.assertEqual(audit["Effect on Report"].tolist(), ["Discontinued in Books: no supplier reorder"])
+        # Older inputs without the Discontinued list reorder as before.
+        del inputs["discontinued"]
+        self.assertEqual(build_weekly_report(inputs, 26)[0].set_index("SKU").loc["048-001", "Discontinued"], "")
+
+    def test_item_name_is_red_for_discontinued_and_blue_for_new_products(self):
+        from io import BytesIO
+        import openpyxl
+        from report_store import attention_css, item_status
+        skus = ["047-003-24", "048-001-24", "049-001-24", "050-001-24"]
+        names = ["Plain", "Ended", "Fresh", "Both"]
+        stock = pd.DataFrame({"sku": skus, "closing_stock": [10] * 4})
+        inputs = {"sales_cy": prepare_source(pd.DataFrame({"sku": skus, "item_name": names, "quantity_sold": [50] * 4,
+                                                           "amount": [1000] * 4}), "sales"),
+                  "stock_cy": prepare_source(stock, "stock"), "bonded_stock_file": prepare_source(stock, "bonded_stock_uploaded"),
+                  "twc_stock": prepare_source(stock.assign(closing_stock=0), "twc_stock"),
+                  "discontinued": pd.DataFrame({"sku_key": ["048001", "050001"]}),
+                  "new": pd.DataFrame({"sku_key": ["049001", "050001"]})}
+        report, _ = build_weekly_report(inputs, 26)
+        # Discontinued wins when an item is ticked both.
+        self.assertEqual(dict(zip(report["Item Name"], item_status(report))),
+                         {"Plain": "", "Ended": "discontinued", "Fresh": "new", "Both": "discontinued"})
+        workbook = openpyxl.load_workbook(BytesIO(report_excel_bytes(report)))
+        def fills(sheet, column):
+            headers = [cell.value for cell in workbook[sheet][1]]
+            rows = workbook[sheet].iter_rows(min_row=2)
+            return {row[headers.index("Item Name")].value: row[headers.index(column)].fill.fgColor.rgb[-6:]
+                    if row[headers.index(column)].fill.fill_type else None for row in rows}
+        red, blue = "FF0000", "0070C0"
+        self.assertEqual(fills("Weekly Report", "Item Name"), {"Plain": None, "Ended": red, "Fresh": blue, "Both": red})
+        self.assertEqual(fills("Clear from Bond", "Item Name"), {"Plain": None, "Ended": red, "Fresh": blue, "Both": red})
+        self.assertEqual(fills("Supplier Reorders", "Item Name"), {"Plain": None, "Fresh": blue})
+        # The SKU cell keeps its supplier reorder / clear from bond colours.
+        self.assertEqual(fills("Weekly Report", "SKU"), {"Plain": "FFC7CE", "Ended": "DDEBF7", "Fresh": "FFC7CE", "Both": "DDEBF7"})
+        key = {(row[1], row[2]) for row in workbook["Colour Key"].iter_rows(min_row=2, values_only=True)}
+        self.assertIn(("Item Name", "Discontinued in Zoho Books: no longer bought from the supplier"), key)
+        self.assertIn(("Item Name", "NEW in Zoho Books: newly added to the portfolio"), key)
+        view = weekly_report_view(report)
+        css = attention_css(view, item_status(report))["Item Name"]
+        self.assertEqual(dict(zip(view["Item Name"], css.str.contains("#FF0000"))), {"Plain": False, "Ended": True, "Fresh": False, "Both": True})
+        self.assertEqual(dict(zip(view["Item Name"], css.str.contains("#0070C0"))), {"Plain": False, "Ended": False, "Fresh": True, "Both": False})
+        # Reports saved before these flags existed have no item status colours.
+        self.assertEqual(item_status(report.drop(columns=["Discontinued", "New"])).tolist(), [""] * 4)
+
     def test_action_sheets_list_only_flagged_products_most_urgent_first(self):
         from io import BytesIO
         import openpyxl
@@ -551,6 +647,7 @@ class BooksPipelineIntegrationTests(unittest.TestCase):
         snapshot_day = datetime.fromisoformat(metadata["stock_snapshot_at"]).astimezone(timezone(timedelta(hours=2))).date()
         self.assertEqual(metadata["stock_as_of"], snapshot_day.isoformat())
         self.assertEqual(metadata["sales_as_of"], "2026-10-25")
+        self.assertEqual(inputs["discontinued"].sku_key.tolist(), [])
         report, _ = build_weekly_report(inputs, elapsed_weeks(date(2026, 10, 25)))
         self.assertEqual(report["Total Stock"].iloc[0], 20)
         self.assertEqual(report["Item Name"].iloc[0], "Wine")

@@ -46,6 +46,8 @@ STYLES = {
     "clear": ("1F4E78", "FFFFFF", True), "reorder_qty": ("FFC7CE", "9C0006", True),
     "clear_qty": ("DDEBF7", "1F4E78", True), "up": (None, "006100", False),
     "down": (None, "C00000", False), "muted": (None, "A6A6A6", False),
+    # Item status from Zoho Books, in Excel's standard red and blue.
+    "discontinued": ("FF0000", "FFFFFF", True), "new": ("0070C0", "FFFFFF", True),
 }
 COLOUR_KEY = [  # (style, example, column, meaning)
     ("good", "Ahead", "Sales Performance / vs Target", "10% or more above the expected YTD sales"),
@@ -67,12 +69,26 @@ COLOUR_KEY = [  # (style, example, column, meaning)
     ("clear_qty", "60", "Qty to be cleared from Bond", "Bottles to clear from bond"),
     ("bad", "047-003", "SKU", "Product needs a supplier reorder"),
     ("info", "047-003", "SKU", "Product needs stock cleared from bond"),
+    ("discontinued", "Wine name", "Item Name", "Discontinued in Zoho Books: no longer bought from the supplier"),
+    ("new", "Wine name", "Item Name", "NEW in Zoho Books: newly added to the portfolio"),
     ("muted", "0", "Any number", "Zero"),
 ]
 
 
-def attention_styles(view):
-    """Style key per cell of a report view (published labels); blank means no style."""
+def item_status(report):
+    """Zoho Books item status per report row: "discontinued", "new" or blank.
+
+    Discontinued wins when both are ticked. Reports saved before these flags have none.
+    """
+    flag = lambda column: report[column].eq("Yes") if column in report else pd.Series(False, index=report.index)
+    return pd.Series(np.where(flag("Discontinued"), "discontinued", np.where(flag("New"), "new", "")), index=report.index)
+
+
+def attention_styles(view, status=None):
+    """Style key per cell of a report view (published labels); blank means no style.
+
+    `status` is item_status() for the report the view was taken from.
+    """
     styles = pd.DataFrame("", index=view.index, columns=view.columns)
     def mark(column, mask, style):
         if column in view:
@@ -104,19 +120,23 @@ def attention_styles(view):
     mark("Qty to be cleared from Bond", number("Qty to be cleared from Bond") > 0, "clear_qty")
     mark("SKU", reorder, "bad")
     mark("SKU", clear, "info")
+    if status is not None:
+        status = status.reindex(view.index)
+        mark("Item Name", status.eq("discontinued"), "discontinued")
+        mark("Item Name", status.eq("new"), "new")
     for column in view.select_dtypes(include="number"):
         mark(column, view[column].eq(0), "muted")
     return styles
 
 
-def attention_css(view):
+def attention_css(view, status=None):
     """The same styles as CSS for a pandas Styler."""
     def css(key):
         if not key:
             return ""
         fill, colour, bold = STYLES[key]
         return (f"background-color: #{fill}; " if fill else "") + f"color: #{colour};" + (" font-weight: bold;" if bold else "")
-    return attention_styles(view).map(css)
+    return attention_styles(view, status).map(css)
 
 
 SUPPLIER_REORDER_COLUMNS = ["SKU", "Item Name", "Brand", "Avg Weekly Sales", "Current Total Stock", "Cleared Stock",
@@ -163,12 +183,15 @@ def purchase_order_audit(report, audit):
         result["Confidence"] = "Exact item ID"
         for target, source in [("Total Open PO Qty (SKU)", "PO Reorder Credit Qty"),
                                ("Supplier Need Before PO", "Supplier Need Before PO"),
-                               ("Supplier Qty After PO", "Bonded Est. Reorder Qty")]:
+                               ("Supplier Qty After PO", "Bonded Est. Reorder Qty"),
+                               ("Discontinued", "Discontinued")]:
             if source in lookup:
                 result[target] = keys.map(lookup[source])
         def effect(row):
             if row.get("Status") != "Matched":
                 return "Product is outside this report selection"
+            if row.get("Discontinued") == "Yes":
+                return "Discontinued in Books: no supplier reorder"
             if row.get("Outstanding Qty", 0) <= 0:
                 return "No billed units awaiting receipt"
             before, after, ordered = (row.get(c) for c in ("Supplier Need Before PO", "Supplier Qty After PO", "Total Open PO Qty (SKU)"))
@@ -247,6 +270,7 @@ def report_excel_bytes(report, audit=None):
     """Export the complete report and PO audit with the reference's layout."""
     buffer = BytesIO()
     export = weekly_report_view(report)
+    status = item_status(report)
     audit = purchase_order_audit_view(report, audit)
     reorders, clears = action_lists(export)
     report_sheets = {"Weekly Report": export}
@@ -292,7 +316,8 @@ def report_excel_bytes(report, audit=None):
                         data.number_format = "dd/mm/yyyy"
             if sheet.title in report_sheets:
                 # Static cell styles travel with their rows when the sheet is sorted or filtered.
-                for (row, column), key in attention_styles(report_sheets[sheet.title].reset_index(drop=True)).stack().items():
+                styles = attention_styles(report_sheets[sheet.title], status).reset_index(drop=True)
+                for (row, column), key in styles.stack().items():
                     if key:
                         fill, font = cell_styles[key]
                         data = sheet.cell(row + 2, report_sheets[sheet.title].columns.get_loc(column) + 1)

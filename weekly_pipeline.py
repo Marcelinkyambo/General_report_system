@@ -13,7 +13,7 @@ def build_weekly_report(inputs, weeks_elapsed, growth_pct=.2, brand_rates=None):
     if not 0 < weeks_elapsed <= 52:
         raise ValueError("Weeks elapsed must be greater than zero and no more than 52.")
     keys = ["sales_cy", "sales_py", "stock_cy", "stock_py", "purchases_cy", "purchases_py",
-            "twc_stock", "bonded_stock_file", "in_transit", "item_details", "planning", "product_names"]
+            "twc_stock", "bonded_stock_file", "in_transit", "item_details", "planning", "product_names", "discontinued", "new"]
     inputs = {**{key: pd.DataFrame() for key in keys}, **inputs}
     for key in keys:
         frame = inputs[key]
@@ -344,9 +344,17 @@ def build_weekly_report(inputs, weeks_elapsed, growth_pct=.2, brand_rates=None):
         df["open_po_qty"] = 0
         df["billed_po_qty"] = 0
         df["unbilled_po_qty"] = 0
+    # Products ticked Discontinued in Books are no longer bought: never suggest a supplier order.
+    # Clearing their bonded stock is still suggested, so the remaining bottles can be sold.
+    discontinued = inputs["discontinued"]
+    df["discontinued"] = df.sku_key.isin(discontinued.sku_key) if "sku_key" in discontinued else False
+    df.loc[df.discontinued, "bonded_est_reorder_qty"] = 0
     df["supplier_need_before_po"] = df.bonded_est_reorder_qty
     df["bonded_est_reorder_qty"] = (df.supplier_need_before_po - df.open_po_qty).clip(lower=0)
     df.loc[df.bonded_est_reorder_qty.eq(0), "bonded_reorder"] = ""
+    # Products ticked NEW in Books (newly added to the portfolio) are highlighted in the report.
+    new = inputs["new"]
+    df["new"] = df.sku_key.isin(new.sku_key) if "sku_key" in new else False
 
     # ── Build final report ──
     report = pd.DataFrame({
@@ -397,6 +405,8 @@ def build_weekly_report(inputs, weeks_elapsed, growth_pct=.2, brand_rates=None):
         "Billed Qty (PO)": df["billed_po_qty"],
         "PO Reorder Credit Qty": df["open_po_qty"],
         "Supplier Need Before PO": df["supplier_need_before_po"],
+        "Discontinued": np.where(df["discontinued"], "Yes", ""),
+        "New": np.where(df["new"], "Yes", ""),
         "CY Purchases": df["purchases_cy"],
         "PY Purchases": df["purchases_py"],
         # Movement
@@ -420,6 +430,7 @@ def build_weekly_report(inputs, weeks_elapsed, growth_pct=.2, brand_rates=None):
         "total_bonded": int(df["bonded_stock"].sum()),
         "reorder_bonded": int((df["bonded_reorder"] == "REORDER").sum()),
         "reorder_twc": int((df["twc_reorder"] == "CLEAR").sum()),
+        "discontinued": int(df["discontinued"].sum()),
         "stockout_high": int((df["stockout_risk"] == "⚠️ HIGH").sum()),
         "twc_over_total_count": _twc_over_total,
     }
